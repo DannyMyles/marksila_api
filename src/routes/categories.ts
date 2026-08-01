@@ -4,12 +4,13 @@ import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
 import { slugify } from '../utils/slugify';
 import { ApiError } from '../middleware/errorHandler';
+import { parseId } from '../utils/validation';
 
 export const categoriesRouter = Router();
 
 const categoryInputSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
+  name: z.string().trim().min(1).max(100),
+  description: z.string().trim().max(1000).optional(),
 });
 
 /**
@@ -72,7 +73,7 @@ categoriesRouter.post('/', requireAdminKey, async (req, res, next) => {
  */
 categoriesRouter.put('/:id', requireAdminKey, async (req, res, next) => {
   try {
-    const id = Number(req.params.id);
+    const id = parseId(req.params.id);
     const input = categoryInputSchema.partial().parse(req.body);
     const data: { name?: string; description?: string; slug?: string } = { ...input };
     if (input.name) data.slug = slugify(input.name);
@@ -93,7 +94,7 @@ categoriesRouter.put('/:id', requireAdminKey, async (req, res, next) => {
  */
 categoriesRouter.delete('/:id', requireAdminKey, async (req, res, next) => {
   try {
-    const id = Number(req.params.id);
+    const id = parseId(req.params.id);
     const productCount = await prisma.product.count({ where: { categoryId: id } });
     if (productCount > 0) {
       throw new ApiError(409, `Cannot delete category with ${productCount} product(s). Reassign or delete them first.`);

@@ -1,8 +1,118 @@
 import 'dotenv/config';
+import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
 import { slugify } from '../src/utils/slugify';
 
 const prisma = new PrismaClient();
+
+const ADMIN_EMAIL = 'admin@marksila254.com';
+const ADMIN_PASSWORD = 'Marksila254!Admin';
+
+interface TrainingSeed {
+  title: string;
+  description: string;
+  features: string[];
+  price: string;
+  image: string;
+  icon: string;
+  color: string;
+  popular?: boolean;
+}
+
+const trainings: TrainingSeed[] = [
+  {
+    title: 'Personal Training',
+    description: 'One-on-one customized training sessions tailored to your specific goals, fitness level, and schedule.',
+    features: ['Custom workout plans', 'Progress tracking', 'Technique guidance', 'Motivation & accountability'],
+    price: 'From KES 2,000/session',
+    image: '/images/025.JPG',
+    icon: 'Dumbbell',
+    color: 'from-orange-500 to-red-500',
+  },
+  {
+    title: 'Group Classes',
+    description: 'Energetic group workouts designed to push you harder while enjoying the camaraderie of fellow fitness enthusiasts.',
+    features: ['HIIT sessions', 'Strength training', 'Cardio workouts', 'Team motivation'],
+    price: 'From KES 500/session',
+    image: '/images/011.jpeg',
+    icon: 'Users',
+    color: 'from-fitness-primary-dark to-fitness-primary',
+    popular: true,
+  },
+  {
+    title: 'Nutrition Coaching',
+    description: 'Comprehensive nutrition guidance and meal planning to fuel your body and support your fitness goals.',
+    features: ['Personalized meal plans', 'Macro calculations', 'Food education', 'Habit formation'],
+    price: 'From KES 3,000/month',
+    image: '/images/006.JPG',
+    icon: 'Heart',
+    color: 'from-green-500 to-emerald-500',
+  },
+  {
+    title: 'Online Training',
+    description: 'Professional training programs you can follow from anywhere, with virtual support and guidance.',
+    features: ['Video workouts', 'Weekly check-ins', 'App support', 'Flexible scheduling'],
+    price: 'From KES 5,000/month',
+    image: '/images/002.jpg',
+    icon: 'Zap',
+    color: 'from-purple-500 to-pink-500',
+  },
+  {
+    title: 'Weight Loss Program',
+    description: 'Structured programs designed to help you lose weight safely and sustainably through training and nutrition.',
+    features: ['Body composition analysis', 'Calorie guidance', 'Exercise programming', 'Lifestyle coaching'],
+    price: 'From KES 15,000/month',
+    image: '/images/004.JPG',
+    icon: 'Award',
+    color: 'from-blue-500 to-indigo-500',
+  },
+  {
+    title: 'Muscle Building',
+    description: 'Hypertrophy-focused training programs to help you build lean muscle mass and increase strength.',
+    features: ['Progressive overload', 'Split routines', 'Recovery protocols', 'Supplement guidance'],
+    price: 'From KES 18,000/month',
+    image: '/images/009.jpg',
+    icon: 'Clock',
+    color: 'from-yellow-500 to-orange-500',
+  },
+];
+
+interface TestimonialSeed {
+  name: string;
+  role: string;
+  content: string;
+  rating: number;
+  avatarColor: string;
+  achievement?: string;
+  featured?: boolean;
+}
+
+const testimonials: TestimonialSeed[] = [
+  {
+    name: 'Sarah M.',
+    role: 'Weight Loss Client',
+    content: 'Marksila254 transformed my life! I lost 30kg in 6 months with personalized training and nutrition guidance. The support and motivation kept me going even on tough days.',
+    rating: 5,
+    avatarColor: '#FF6B35',
+    achievement: '-30kg Lost',
+  },
+  {
+    name: 'James K.',
+    role: 'Muscle Building',
+    content: "The best personal trainer in Nairobi! Customized programs that actually work. I've gained significant muscle mass and improved my overall strength dramatically.",
+    rating: 5,
+    avatarColor: '#3b82f6',
+    achievement: '+15kg Muscle',
+  },
+  {
+    name: 'Emily R.',
+    role: 'Fitness Enthusiast',
+    content: "Amazing energy and expertise! The group classes are incredibly motivating. I've never felt stronger or more confident in my fitness journey.",
+    rating: 5,
+    avatarColor: '#10b981',
+    achievement: 'Marathon Ready',
+  },
+];
 
 const IMAGES_DIR = process.env.MARK254_IMAGES_DIR;
 if (!IMAGES_DIR) {
@@ -338,6 +448,65 @@ async function main() {
   }
 
   console.log(`Created ${created} products (${products.length - created} already existed).`);
+
+  const existingAdmin = await prisma.user.findUnique({ where: { email: ADMIN_EMAIL } });
+  if (!existingAdmin) {
+    const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+    await prisma.user.create({
+      data: {
+        name: 'Admin',
+        username: 'admin',
+        email: ADMIN_EMAIL,
+        password: passwordHash,
+        role: 'admin',
+      },
+    });
+    console.log(`Created admin user: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}`);
+  } else {
+    console.log('Admin user already exists, skipping.');
+  }
+
+  let trainingsCreated = 0;
+  for (const [index, t] of trainings.entries()) {
+    const slug = slugify(t.title);
+    const existingTraining = await prisma.training.findUnique({ where: { slug } });
+    if (existingTraining) continue;
+    await prisma.training.create({
+      data: {
+        title: t.title,
+        slug,
+        description: t.description,
+        features: JSON.stringify(t.features),
+        price: t.price,
+        image: t.image,
+        icon: t.icon,
+        color: t.color,
+        popular: t.popular ?? false,
+        order: index,
+      },
+    });
+    trainingsCreated += 1;
+  }
+  console.log(`Created ${trainingsCreated} trainings (${trainings.length - trainingsCreated} already existed).`);
+
+  let testimonialsCreated = 0;
+  for (const t of testimonials) {
+    const existingTestimonial = await prisma.testimonial.findFirst({ where: { name: t.name } });
+    if (existingTestimonial) continue;
+    await prisma.testimonial.create({
+      data: {
+        name: t.name,
+        role: t.role,
+        content: t.content,
+        rating: t.rating,
+        avatarColor: t.avatarColor,
+        achievement: t.achievement,
+        featured: t.featured ?? true,
+      },
+    });
+    testimonialsCreated += 1;
+  }
+  console.log(`Created ${testimonialsCreated} testimonials (${testimonials.length - testimonialsCreated} already existed).`);
 }
 
 main()

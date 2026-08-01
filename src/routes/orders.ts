@@ -2,25 +2,30 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
+import { optionalAuth, requireAuth } from '../middleware/userAuth';
 import { generateOrderNumber } from '../utils/orderNumber';
-import { paymentProvider } from '../payments/StubMpesaProvider';
+import { paymentProvider } from '../payments';
 import { ApiError } from '../middleware/errorHandler';
+import { sendMail, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
+import { env } from '../env';
+import { parseId, phoneSchema } from '../utils/validation';
+import { publicWriteLimiter } from '../middleware/rateLimiters';
 
 export const ordersRouter = Router();
 
 const orderItemSchema = z.object({
   productId: z.number().int().positive(),
-  quantity: z.number().int().positive(),
-  size: z.string().optional(),
-  color: z.string().optional(),
+  quantity: z.number().int().positive().max(100),
+  size: z.string().max(50).optional(),
+  color: z.string().max(50).optional(),
 });
 
 const createOrderSchema = z.object({
-  customerName: z.string().min(1),
-  customerEmail: z.string().email(),
-  customerPhone: z.string().min(7),
-  shippingAddress: z.string().min(1),
-  items: z.array(orderItemSchema).min(1),
+  customerName: z.string().trim().min(1).max(100),
+  customerEmail: z.string().trim().email().max(255),
+  customerPhone: phoneSchema,
+  shippingAddress: z.string().trim().min(1).max(500),
+  items: z.array(orderItemSchema).min(1).max(100),
 });
 
 function serializeOrder(order: any) {
@@ -36,6 +41,7 @@ function serializeOrder(order: any) {
     paymentStatus: order.paymentStatus,
     paymentRef: order.paymentRef,
     subtotal: order.subtotal,
+    shipping: order.total - order.subtotal,
     total: order.total,
     createdAt: order.createdAt,
     items: (order.items ?? []).map((i: any) => ({
@@ -57,7 +63,7 @@ function serializeOrder(order: any) {
  *     summary: Create an order (checkout). Guest checkout — no auth required.
  *     tags: [Orders]
  */
-ordersRouter.post('/', async (req, res, next) => {
+ordersRouter.post('/', publicWriteLimiter, optionalAuth, async (req, res, next) => {
   try {
     const input = createOrderSchema.parse(req.body);
 
@@ -75,7 +81,11 @@ ordersRouter.post('/', async (req, res, next) => {
       const product = productById.get(item.productId)!;
       return sum + product.price * item.quantity;
     }, 0);
-    const total = subtotal; // no shipping/tax/coupon logic in this milestone
+    // Flat shipping fee, free above KES 5000 — must match CartClient.tsx's
+    // identical threshold so the amount displayed pre-checkout matches the
+    // amount actually charged via M-Pesa.
+    const shipping = subtotal > 5000 ? 0 : 500;
+    const total = subtotal + shipping;
 
     const orderNumber = generateOrderNumber();
     const payment = await paymentProvider.initiate({
@@ -95,6 +105,7 @@ ordersRouter.post('/', async (req, res, next) => {
         total,
         paymentStatus: payment.status,
         paymentRef: payment.reference,
+        userId: req.user?.id,
         items: {
           create: input.items.map((item) => {
             const product = productById.get(item.productId)!;
@@ -111,6 +122,31 @@ ordersRouter.post('/', async (req, res, next) => {
       },
       include: { items: true },
     });
+
+    // Email is a side effect of an already-persisted order — never let a
+    // slow/failed send delay or fail the checkout response.
+    const confirmation = orderConfirmationEmail({
+      orderNumber: order.orderNumber,
+      customerName: order.customerName,
+      items: order.items.map((i) => ({ name: i.name, price: i.price, quantity: i.quantity })),
+      subtotal: order.subtotal,
+      total: order.total,
+      shippingAddress: order.shippingAddress,
+    });
+    sendMail({ to: order.customerEmail, ...confirmation }).catch((err) =>
+      console.error(`[orders] Failed to send confirmation email for ${order.orderNumber}:`, err)
+    );
+
+    const alert = orderAlertEmail({
+      orderNumber: order.orderNumber,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      customerEmail: order.customerEmail,
+      total: order.total,
+    });
+    sendMail({ to: env.adminNotificationEmail, ...alert }).catch((err) =>
+      console.error(`[orders] Failed to send admin alert email for ${order.orderNumber}:`, err)
+    );
 
     res.status(201).json({ order: serializeOrder(order), payment });
   } catch (err) {
@@ -140,6 +176,27 @@ ordersRouter.get('/', requireAdminKey, async (_req, res, next) => {
 
 /**
  * @openapi
+ * /api/orders/mine:
+ *   get:
+ *     summary: List the logged-in customer's own orders
+ *     tags: [Orders]
+ *     security: [{ BearerAuth: [] }]
+ */
+ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
+  try {
+    const orders = await prisma.order.findMany({
+      where: { userId: req.user!.id },
+      include: { items: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(orders.map(serializeOrder));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @openapi
  * /api/orders/{id}:
  *   get:
  *     summary: Get a single order (admin)
@@ -149,11 +206,62 @@ ordersRouter.get('/', requireAdminKey, async (_req, res, next) => {
 ordersRouter.get('/:id', requireAdminKey, async (req, res, next) => {
   try {
     const order = await prisma.order.findUnique({
-      where: { id: Number(req.params.id) },
+      where: { id: parseId(req.params.id) },
       include: { items: true },
     });
     if (!order) throw new ApiError(404, 'Order not found');
     res.json(serializeOrder(order));
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/status:
+ *   get:
+ *     summary: Get the status of the logged-in customer's own order (for payment polling)
+ *     tags: [Orders]
+ *     security: [{ BearerAuth: [] }]
+ */
+ordersRouter.get('/:id/status', requireAuth, async (req, res, next) => {
+  try {
+    const order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
+    if (!order) throw new ApiError(404, 'Order not found');
+    if (order.userId !== req.user!.id) throw new ApiError(403, 'Not your order');
+    res.json({ status: order.status, paymentStatus: order.paymentStatus });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/retry-payment:
+ *   post:
+ *     summary: Re-initiate M-Pesa payment for an order whose STK push failed, was cancelled, or timed out
+ *     tags: [Orders]
+ *     security: [{ BearerAuth: [] }]
+ */
+ordersRouter.post('/:id/retry-payment', requireAuth, publicWriteLimiter, async (req, res, next) => {
+  try {
+    const order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
+    if (!order) throw new ApiError(404, 'Order not found');
+    if (order.userId !== req.user!.id) throw new ApiError(403, 'Not your order');
+    if (order.paymentStatus === 'paid') throw new ApiError(409, 'This order is already paid');
+
+    const payment = await paymentProvider.initiate({
+      orderNumber: order.orderNumber,
+      amount: order.total,
+      phone: order.customerPhone,
+    });
+
+    const updated = await prisma.order.update({
+      where: { id: order.id },
+      data: { paymentStatus: payment.status, paymentRef: payment.reference },
+      include: { items: true },
+    });
+    res.json({ order: serializeOrder(updated), payment });
   } catch (err) {
     next(err);
   }
@@ -179,10 +287,23 @@ ordersRouter.patch('/:id/status', requireAdminKey, async (req, res, next) => {
       throw new ApiError(400, 'Provide status and/or paymentStatus');
     }
     const order = await prisma.order.update({
-      where: { id: Number(req.params.id) },
+      where: { id: parseId(req.params.id) },
       data: input,
       include: { items: true },
     });
+
+    if (input.status) {
+      const { subject, html } = orderStatusUpdateEmail({
+        orderNumber: order.orderNumber,
+        customerName: order.customerName,
+        status: order.status,
+        total: order.total,
+      });
+      sendMail({ to: order.customerEmail, subject, html }).catch((err) =>
+        console.error(`[orders] Failed to send status update email for ${order.orderNumber}:`, err)
+      );
+    }
+
     res.json(serializeOrder(order));
   } catch (err) {
     next(err);

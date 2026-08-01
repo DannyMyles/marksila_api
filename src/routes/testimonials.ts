@@ -1,0 +1,175 @@
+import { Router } from 'express';
+import path from 'path';
+import { z } from 'zod';
+import { prisma } from '../prisma';
+import { requireAdminRole } from '../middleware/userAuth';
+import { ApiError } from '../middleware/errorHandler';
+import { uploadTestimonialPhoto, testimonialsUploadDir } from '../uploads';
+import { parseId, urlOrPathSchema } from '../utils/validation';
+
+export const testimonialsRouter = Router();
+
+function photoInfoFor(t: any) {
+  const hasPhoto = Boolean(t.photoFilename);
+  return {
+    hasPhoto,
+    contentType: t.photoContentType ?? undefined,
+    size: t.photoSize ?? undefined,
+    url: hasPhoto ? `/api/v1/testimonials/${t.id}/photo` : '',
+  };
+}
+
+function serializeTestimonial(t: any) {
+  const photoInfo = photoInfoFor(t);
+  return {
+    id: String(t.id),
+    name: t.name,
+    role: t.role,
+    company: t.company ?? undefined,
+    content: t.content,
+    rating: t.rating,
+    image: t.image ?? '',
+    avatarColor: t.avatarColor,
+    achievement: t.achievement ?? undefined,
+    photoUrl: photoInfo.url,
+    photoInfo,
+    featured: t.featured,
+    isActive: t.isActive,
+    createdAt: t.createdAt,
+    updatedAt: t.updatedAt,
+  };
+}
+
+/**
+ * @openapi
+ * /api/v1/testimonials:
+ *   get:
+ *     summary: List all testimonials
+ *     tags: [Testimonials]
+ */
+testimonialsRouter.get('/', async (_req, res, next) => {
+  try {
+    const testimonials = await prisma.testimonial.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json({ testimonials: testimonials.map(serializeTestimonial) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+testimonialsRouter.get('/:id/photo', async (req, res, next) => {
+  try {
+    const testimonial = await prisma.testimonial.findUnique({ where: { id: parseId(req.params.id) } });
+    if (!testimonial) throw new ApiError(404, 'Testimonial not found');
+    if (!testimonial.photoFilename) throw new ApiError(404, 'No photo for this testimonial');
+    res.sendFile(path.join(testimonialsUploadDir, testimonial.photoFilename));
+  } catch (err) {
+    next(err);
+  }
+});
+
+testimonialsRouter.get('/:id', async (req, res, next) => {
+  try {
+    const testimonial = await prisma.testimonial.findUnique({ where: { id: parseId(req.params.id) } });
+    if (!testimonial) throw new ApiError(404, 'Testimonial not found');
+    res.json({ testimonial: serializeTestimonial(testimonial) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const boolField = z
+  .string()
+  .optional()
+  .transform((v) => (v === undefined ? undefined : v === 'true'));
+
+const testimonialFormSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  role: z.string().trim().min(1).max(100),
+  company: z.string().trim().max(100).optional(),
+  content: z.string().min(20).max(500),
+  rating: z.coerce.number().int().min(1).max(5),
+  image: urlOrPathSchema.optional(),
+  avatarColor: z.string().min(1).max(50),
+  achievement: z.string().trim().max(200).optional(),
+  featured: boolField,
+});
+
+/**
+ * @openapi
+ * /api/v1/testimonials:
+ *   post:
+ *     summary: Create a testimonial (admin)
+ *     tags: [Testimonials]
+ *     security: [{ BearerAuth: [] }]
+ */
+testimonialsRouter.post('/', requireAdminRole, uploadTestimonialPhoto.single('photo'), async (req, res, next) => {
+  try {
+    const input = testimonialFormSchema.parse(req.body);
+    const file = req.file;
+    const testimonial = await prisma.testimonial.create({
+      data: {
+        name: input.name,
+        role: input.role,
+        company: input.company,
+        content: input.content,
+        rating: input.rating,
+        image: input.image,
+        avatarColor: input.avatarColor,
+        achievement: input.achievement,
+        featured: input.featured ?? true,
+        photoFilename: file?.filename,
+        photoContentType: file?.mimetype,
+        photoSize: file?.size,
+      },
+    });
+    res.status(201).json({ testimonial: serializeTestimonial(testimonial) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const testimonialUpdateFormSchema = testimonialFormSchema.partial();
+
+testimonialsRouter.put('/:id', requireAdminRole, uploadTestimonialPhoto.single('photo'), async (req, res, next) => {
+  try {
+    const input = testimonialUpdateFormSchema.parse(req.body);
+    const id = parseId(req.params.id);
+    const file = req.file;
+
+    const data: Record<string, unknown> = { ...input };
+    if (file) {
+      data.photoFilename = file.filename;
+      data.photoContentType = file.mimetype;
+      data.photoSize = file.size;
+    }
+
+    const testimonial = await prisma.testimonial.update({ where: { id }, data });
+    res.json({ testimonial: serializeTestimonial(testimonial) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const statusSchema = z.object({ isActive: z.boolean() });
+
+testimonialsRouter.patch('/:id/status', requireAdminRole, async (req, res, next) => {
+  try {
+    const input = statusSchema.parse(req.body);
+    const testimonial = await prisma.testimonial.update({
+      where: { id: parseId(req.params.id) },
+      data: { isActive: input.isActive },
+    });
+    res.json({ testimonial: serializeTestimonial(testimonial) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+testimonialsRouter.delete('/:id', requireAdminRole, async (req, res, next) => {
+  try {
+    await prisma.testimonial.delete({ where: { id: parseId(req.params.id) } });
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});

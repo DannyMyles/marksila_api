@@ -21,6 +21,92 @@ enum PaymentStatus {
   failed
 }
 
+enum UserRole {
+  user
+  admin
+}
+
+model User {
+  id                 Int                 @id @default(autoincrement())
+  name               String
+  username           String              @unique
+  email              String              @unique
+  password           String // bcrypt hash
+  role               UserRole            @default(user)
+  isActive           Boolean             @default(true)
+  lastLogin          DateTime?
+  resetToken         String?             @unique
+  resetTokenExpiry   DateTime?
+  emailVerified      Boolean             @default(true)
+  verifyToken        String?             @unique
+  verifyTokenExpiry  DateTime?
+  eventRegistrations EventRegistration[]
+  orders             Order[]
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+}
+
+model Blog {
+  id               Int      @id @default(autoincrement())
+  title            String
+  slug             String   @unique
+  excerpt          String   @db.Text
+  content          String   @db.Text
+  category         String
+  author           String
+  authorId         Int?
+  readTime         String?
+  imageUrl         String?  @db.VarChar(512)
+  imageFilename    String?
+  imageContentType String?
+  imageSize        Int?
+  featured         Boolean  @default(false)
+  published        Boolean  @default(true)
+  views            Int      @default(0)
+  likes            Int      @default(0)
+  tags             String?  @db.Text // JSON-encoded string[]
+  metaTitle        String?
+  metaDescription  String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Testimonial {
+  id                Int      @id @default(autoincrement())
+  name              String
+  role              String
+  company           String?
+  content           String   @db.Text
+  rating            Int
+  image             String? // initials fallback, e.g. "JD" — used when no photo is uploaded
+  avatarColor       String   @default("#3b82f6")
+  photoFilename     String?
+  photoContentType  String?
+  photoSize         Int?
+  achievement       String? // short highlight badge, e.g. "-30kg Lost"
+  featured          Boolean  @default(true)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Training {
+  id          Int      @id @default(autoincrement())
+  title       String
+  slug        String?  @unique
+  description String   @db.Text
+  features    String   @db.Text // JSON-encoded string[]
+  price       String
+  image       String
+  icon        String?
+  color       String?
+  popular     Boolean  @default(false)
+  order       Int      @default(0)
+  published   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
 model Category {
   id          Int       @id @default(autoincrement())
   name        String
@@ -76,8 +162,18 @@ model Order {
   subtotal        Int
   total           Int
   items           OrderItem[]
+  user            User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId          Int?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
+
+  @@index([userId])
+}
+
+model NewsletterSubscriber {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  createdAt DateTime @default(now())
 }
 
 model OrderItem {
@@ -93,4 +189,72 @@ model OrderItem {
   color     String?
 
   @@index([orderId])
+}
+
+enum TicketStatus {
+  pending_payment
+  confirmed
+  cancelled
+}
+
+model Event {
+  id               Int                 @id @default(autoincrement())
+  title            String
+  slug             String              @unique
+  description      String              @db.Text
+  date             DateTime
+  time             String // display string, e.g. "6:00 AM - 7:00 AM"
+  location         String
+  trainers         String              @db.Text // JSON-encoded string[]
+  imageUrl         String?             @db.VarChar(512)
+  imageFilename    String?
+  imageContentType String?
+  imageSize        Int?
+  price            Int // KES, 0 = free
+  maxSpots         Int
+  popular          Boolean             @default(false)
+  published        Boolean             @default(true)
+  registrations EventRegistration[]
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+}
+
+model GalleryCategory {
+  id          Int            @id @default(autoincrement())
+  name        String
+  slug        String         @unique
+  description String?        @db.Text
+  images      GalleryImage[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model GalleryImage {
+  id          Int             @id @default(autoincrement())
+  title       String?
+  filename    String
+  contentType String
+  size        Int
+  category    GalleryCategory @relation(fields: [categoryId], references: [id])
+  categoryId  Int
+  createdAt   DateTime        @default(now())
+
+  @@index([categoryId])
+}
+
+model EventRegistration {
+  id            Int          @id @default(autoincrement())
+  ticketNumber  String       @unique
+  event         Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId       Int
+  user          User         @relation(fields: [userId], references: [id])
+  userId        Int
+  attendeeName  String
+  attendeePhone String
+  status        TicketStatus @default(pending_payment)
+  paymentRef    String?
+  createdAt     DateTime     @default(now())
+
+  @@unique([eventId, userId])
+  @@index([eventId])
 }

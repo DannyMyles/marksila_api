@@ -4,17 +4,18 @@ import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
 import { slugify } from '../utils/slugify';
 import { ApiError } from '../middleware/errorHandler';
+import { parseId } from '../utils/validation';
 
 export const productsRouter = Router();
 
 const productInputSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().min(1),
+  name: z.string().trim().min(1).max(200),
+  description: z.string().trim().min(1).max(5000),
   price: z.number().int().positive(),
   categoryId: z.number().int().positive(),
-  images: z.array(z.string().min(1)).min(1),
-  sizes: z.array(z.string()).optional(),
-  colors: z.array(z.string()).optional(),
+  images: z.array(z.string().min(1).max(2048)).min(1).max(20),
+  sizes: z.array(z.string().max(50)).max(50).optional(),
+  colors: z.array(z.string().max(50)).max(50).optional(),
   inStock: z.boolean().optional(),
   featured: z.boolean().optional(),
   isNew: z.boolean().optional(),
@@ -161,7 +162,7 @@ productsRouter.post('/', requireAdminKey, async (req, res, next) => {
  */
 productsRouter.put('/:id', requireAdminKey, async (req, res, next) => {
   try {
-    const id = Number(req.params.id);
+    const id = parseId(req.params.id);
     const input = productInputSchema.partial().parse(req.body);
 
     const data: any = { ...input };
@@ -197,7 +198,7 @@ productsRouter.put('/:id', requireAdminKey, async (req, res, next) => {
  */
 productsRouter.delete('/:id', requireAdminKey, async (req, res, next) => {
   try {
-    const id = Number(req.params.id);
+    const id = parseId(req.params.id);
     await prisma.product.delete({ where: { id } });
     res.status(204).send();
   } catch (err) {
