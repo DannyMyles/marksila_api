@@ -107,6 +107,27 @@ eventsRouter.get('/', async (req, res, next) => {
   }
 });
 
+/**
+ * @openapi
+ * /api/v1/events/{id}/edit:
+ *   get:
+ *     summary: Get a single event by numeric id, regardless of published status (admin — for the edit form)
+ *     tags: [Events]
+ *     security: [{ BearerAuth: [] }]
+ */
+eventsRouter.get('/:id/edit', requireAdminRole, async (req, res, next) => {
+  try {
+    const event = await prisma.event.findUnique({
+      where: { id: parseId(req.params.id) },
+      include: countActiveRegistrations,
+    });
+    if (!event) throw new ApiError(404, 'Event not found');
+    res.json({ event: serializeEvent(event) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 eventsRouter.get('/:id/image', async (req, res, next) => {
   try {
     const event = await prisma.event.findUnique({ where: { id: parseId(req.params.id) } });
