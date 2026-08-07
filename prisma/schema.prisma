@@ -142,6 +142,7 @@ model ProductImage {
   id        Int      @id @default(autoincrement())
   url       String   @db.VarChar(512)
   position  Int      @default(0)
+  color     String?  // optional tag, e.g. "Black" — lets the shop page swap images when a matching color is selected
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
   productId Int
 
@@ -247,8 +248,10 @@ model EventRegistration {
   ticketNumber  String       @unique
   event         Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
   eventId       Int
-  user          User         @relation(fields: [userId], references: [id])
-  userId        Int
+  // Nullable + SetNull (matches Order.userId) — deleting a user shouldn't
+  // delete their ticket/registration history, just detach it.
+  user          User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId        Int?
   attendeeName  String
   attendeePhone String
   status        TicketStatus @default(pending_payment)

@@ -50,3 +50,7 @@ export const uploadEventImage = eventUploads.uploader;
 const galleryUploads = createImageUploader('gallery');
 export const galleryUploadDir = galleryUploads.dir;
 export const uploadGalleryImages = galleryUploads.uploader;
+
+const productUploads = createImageUploader('products');
+export const productsUploadDir = productUploads.dir;
+export const uploadProductImages = productUploads.uploader;

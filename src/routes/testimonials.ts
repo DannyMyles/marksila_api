@@ -5,7 +5,8 @@ import { prisma } from '../prisma';
 import { requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { uploadTestimonialPhoto, testimonialsUploadDir } from '../uploads';
-import { parseId, urlOrPathSchema } from '../utils/validation';
+import { parseId } from '../utils/validation';
+import { publicWriteLimiter } from '../middleware/rateLimiters';
 
 export const testimonialsRouter = Router();
 
@@ -77,6 +78,61 @@ testimonialsRouter.get('/:id', async (req, res, next) => {
   }
 });
 
+// Deterministic-but-varied avatar color for public submissions, which don't
+// get to pick their own (that's an admin/curation control) — hashing the
+// name keeps the same person's color stable across resubmissions.
+const AVATAR_COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'];
+function pickAvatarColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[hash % AVATAR_COLORS.length];
+}
+
+const testimonialSubmitSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  role: z.string().trim().min(1).max(100),
+  company: z.string().trim().max(100).optional(),
+  content: z.string().min(20).max(500),
+  rating: z.coerce.number().int().min(1).max(5),
+});
+
+/**
+ * @openapi
+ * /api/v1/testimonials/submit:
+ *   post:
+ *     summary: Publicly submit a testimonial (pending admin approval)
+ *     tags: [Testimonials]
+ */
+testimonialsRouter.post('/submit', publicWriteLimiter, uploadTestimonialPhoto.single('photo'), async (req, res, next) => {
+  try {
+    const input = testimonialSubmitSchema.parse(req.body);
+    const file = req.file;
+
+    const testimonial = await prisma.testimonial.create({
+      data: {
+        name: input.name,
+        role: input.role,
+        company: input.company,
+        content: input.content,
+        rating: input.rating,
+        avatarColor: pickAvatarColor(input.name),
+        featured: false,
+        isActive: false,
+        photoFilename: file?.filename,
+        photoContentType: file?.mimetype,
+        photoSize: file?.size,
+      },
+    });
+
+    res.status(201).json({
+      message: 'Thanks! Your testimonial has been submitted and is pending review.',
+      testimonial: serializeTestimonial(testimonial),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 const boolField = z
   .string()
   .optional()
@@ -88,7 +144,10 @@ const testimonialFormSchema = z.object({
   company: z.string().trim().max(100).optional(),
   content: z.string().min(20).max(500),
   rating: z.coerce.number().int().min(1).max(5),
-  image: urlOrPathSchema.optional(),
+  // Despite the name, this holds a short initials fallback (e.g. "JD"),
+  // shown when no photo is uploaded — not a URL/path, so it must not use
+  // urlOrPathSchema (that rejected every admin create/update until now).
+  image: z.string().trim().max(10).optional(),
   avatarColor: z.string().min(1).max(50),
   achievement: z.string().trim().max(200).optional(),
   featured: boolField,
