@@ -40,9 +40,15 @@ mpesaRouter.post('/callback', async (req, res) => {
       return;
     }
 
-    const receiptNumber =
-      callback.ResultCode === 0 ? metadataValue(callback, 'MpesaReceiptNumber') : undefined;
-    const result = { resultCode: callback.ResultCode, resultDesc: callback.ResultDesc, receiptNumber };
+    const succeeded = callback.ResultCode === 0;
+    const result = {
+      resultCode: callback.ResultCode,
+      resultDesc: callback.ResultDesc,
+      receiptNumber: succeeded ? metadataValue(callback, 'MpesaReceiptNumber') : undefined,
+      phone: succeeded ? metadataValue(callback, 'PhoneNumber') : undefined,
+      amount: succeeded ? metadataValue(callback, 'Amount') : undefined,
+      transactionTime: succeeded ? metadataValue(callback, 'TransactionDate') : undefined,
+    };
 
     const order = await prisma.order.findFirst({ where: { paymentRef: callback.CheckoutRequestID } });
     if (order) {

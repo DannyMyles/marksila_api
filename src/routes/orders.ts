@@ -45,6 +45,27 @@ function serializeOrder(order: any) {
     // Admin-visible raw Safaricom result, so a failed payment isn't a mystery.
     paymentResultCode: order.paymentResultCode,
     paymentResultDesc: order.paymentResultDesc,
+    // Full M-Pesa transaction detail for a successful payment. Only ever
+    // populated from a delivered STK callback (the STK Query fallback used
+    // for local/sandbox polling has no equivalent data to offer) — null
+    // until then. billRefNumber/transactionId/businessShortCode/
+    // transactionType aren't separate stored fields: this app always
+    // initiates as CustomerPayBillOnline against a single configured
+    // shortcode, and the STK push's own AccountReference is always the
+    // order number, so those are reported directly rather than duplicated
+    // in the database per-order.
+    mpesa: order.paymentRef
+      ? {
+          billReferenceNumber: order.orderNumber,
+          phoneNumber: order.mpesaPhone,
+          firstName: order.customerName,
+          transactionAmount: order.mpesaAmount,
+          transactionId: order.paymentStatus === 'paid' ? order.paymentRef : null,
+          transactionType: 'CustomerPayBillOnline',
+          transactionTime: order.mpesaTransactionTime,
+          businessShortCode: env.mpesaShortcode,
+        }
+      : null,
     subtotal: order.subtotal,
     shipping: order.total - order.subtotal,
     total: order.total,
@@ -170,6 +191,84 @@ ordersRouter.get('/', requireAdminKey, async (_req, res, next) => {
       orderBy: { createdAt: 'desc' },
     });
     res.json(orders.map(serializeOrder));
+  } catch (err) {
+    next(err);
+  }
+});
+
+function csvCell(value: unknown): string {
+  const str = value === null || value === undefined ? '' : String(value);
+  // Quote whenever needed (comma/quote/newline) and escape embedded quotes
+  // by doubling them, per RFC 4180 — the standard every spreadsheet app
+  // (Excel, Google Sheets, Numbers) expects.
+  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+const EXPORT_COLUMNS = [
+  'Order Number',
+  'Placed At',
+  'Customer Name',
+  'Customer Email',
+  'Customer Phone',
+  'Order Status',
+  'Payment Status',
+  'Subtotal (KES)',
+  'Total (KES)',
+  'Bill Reference Number',
+  'M-Pesa Phone Number',
+  'Transaction Amount (KES)',
+  'Transaction ID',
+  'Transaction Type',
+  'Transaction Time',
+  'Business Short Code',
+  'Payment Result',
+] as const;
+
+function orderToCsvRow(order: any): string {
+  return EXPORT_COLUMNS.map((col) => {
+    switch (col) {
+      case 'Order Number': return csvCell(order.orderNumber);
+      case 'Placed At': return csvCell(new Date(order.createdAt).toISOString());
+      case 'Customer Name': return csvCell(order.customerName);
+      case 'Customer Email': return csvCell(order.customerEmail);
+      case 'Customer Phone': return csvCell(order.customerPhone);
+      case 'Order Status': return csvCell(order.status);
+      case 'Payment Status': return csvCell(order.paymentStatus);
+      case 'Subtotal (KES)': return csvCell(order.subtotal);
+      case 'Total (KES)': return csvCell(order.total);
+      case 'Bill Reference Number': return csvCell(order.mpesa?.billReferenceNumber);
+      case 'M-Pesa Phone Number': return csvCell(order.mpesa?.phoneNumber);
+      case 'Transaction Amount (KES)': return csvCell(order.mpesa?.transactionAmount);
+      case 'Transaction ID': return csvCell(order.mpesa?.transactionId);
+      case 'Transaction Type': return csvCell(order.mpesa ? order.mpesa.transactionType : '');
+      case 'Transaction Time': return csvCell(order.mpesa?.transactionTime ? new Date(order.mpesa.transactionTime).toISOString() : '');
+      case 'Business Short Code': return csvCell(order.mpesa?.businessShortCode);
+      case 'Payment Result': return csvCell(order.paymentResultDesc);
+      default: return '';
+    }
+  }).join(',');
+}
+
+/**
+ * @openapi
+ * /api/orders/export:
+ *   get:
+ *     summary: Download all orders as a CSV report, including full M-Pesa transaction detail (admin)
+ *     tags: [Orders]
+ *     security: [{ AdminKey: [] }]
+ */
+ordersRouter.get('/export', requireAdminKey, async (_req, res, next) => {
+  try {
+    const orders = await prisma.order.findMany({
+      include: { items: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    const rows = orders.map(serializeOrder).map(orderToCsvRow);
+    const csv = [EXPORT_COLUMNS.join(','), ...rows].join('\r\n');
+    const filename = `orders-${new Date().toISOString().slice(0, 10)}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
   } catch (err) {
     next(err);
   }

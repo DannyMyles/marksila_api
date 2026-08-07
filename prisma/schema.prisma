@@ -162,6 +162,13 @@ model Order {
   paymentRef      String? // e.g. stubbed M-Pesa checkoutRequestId
   paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
   paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
+  // Populated from the STK callback's CallbackMetadata on a successful
+  // payment (the STK Query fallback used for local/sandbox polling can't
+  // supply these — Safaricom's query response has no CallbackMetadata — so
+  // they stay null until a real callback lands, e.g. in production).
+  mpesaPhone            String?
+  mpesaAmount           Int?
+  mpesaTransactionTime  DateTime?
   subtotal        Int
   total           Int
   items           OrderItem[]
@@ -260,6 +267,11 @@ model EventRegistration {
   paymentRef    String?
   paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
   paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
+  // See Order.mpesaPhone/mpesaAmount/mpesaTransactionTime — same caveat
+  // about the STK Query fallback not being able to populate these.
+  mpesaPhone            String?
+  mpesaAmount           Int?
+  mpesaTransactionTime  DateTime?
   createdAt     DateTime     @default(now())
 
   @@unique([eventId, userId])
