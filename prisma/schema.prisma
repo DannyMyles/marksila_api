@@ -160,6 +160,8 @@ model Order {
   paymentMethod   String        @default("mpesa")
   paymentStatus   PaymentStatus @default(pending)
   paymentRef      String? // e.g. stubbed M-Pesa checkoutRequestId
+  paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
+  paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
   subtotal        Int
   total           Int
   items           OrderItem[]
@@ -256,6 +258,8 @@ model EventRegistration {
   attendeePhone String
   status        TicketStatus @default(pending_payment)
   paymentRef    String?
+  paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
+  paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
   createdAt     DateTime     @default(now())
 
   @@unique([eventId, userId])

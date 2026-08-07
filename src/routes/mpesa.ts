@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../prisma';
+import { applyMpesaResultToOrder, applyMpesaResultToRegistration } from '../payments/applyMpesaResult';
 
 export const mpesaRouter = Router();
 
@@ -39,17 +40,13 @@ mpesaRouter.post('/callback', async (req, res) => {
       return;
     }
 
-    const succeeded = callback.ResultCode === 0;
-    const receiptNumber = succeeded ? metadataValue(callback, 'MpesaReceiptNumber') : undefined;
+    const receiptNumber =
+      callback.ResultCode === 0 ? metadataValue(callback, 'MpesaReceiptNumber') : undefined;
+    const result = { resultCode: callback.ResultCode, resultDesc: callback.ResultDesc, receiptNumber };
 
     const order = await prisma.order.findFirst({ where: { paymentRef: callback.CheckoutRequestID } });
     if (order) {
-      await prisma.order.update({
-        where: { id: order.id },
-        data: succeeded
-          ? { status: 'paid', paymentStatus: 'paid', paymentRef: String(receiptNumber ?? order.paymentRef) }
-          : { paymentStatus: 'failed' },
-      });
+      await applyMpesaResultToOrder(order, result);
       return;
     }
 
@@ -57,15 +54,7 @@ mpesaRouter.post('/callback', async (req, res) => {
       where: { paymentRef: callback.CheckoutRequestID },
     });
     if (registration) {
-      // A failed/cancelled STK push leaves the registration as-is
-      // (pending_payment) so the customer can retry — no TicketStatus
-      // value represents "failed" the way PaymentStatus does for orders.
-      if (succeeded) {
-        await prisma.eventRegistration.update({
-          where: { id: registration.id },
-          data: { status: 'confirmed', paymentRef: String(receiptNumber ?? registration.paymentRef) },
-        });
-      }
+      await applyMpesaResultToRegistration(registration, result);
       return;
     }
 

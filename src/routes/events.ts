@@ -7,6 +7,8 @@ import { requireAuth, requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { slugify } from '../utils/slugify';
 import { paymentProvider } from '../payments';
+import { describeMpesaResult } from '../payments/mpesaResultCodes';
+import { applyMpesaResultToRegistration } from '../payments/applyMpesaResult';
 import { sendMail, eventTicketEmail, eventRegistrationAlertEmail } from '../mailer';
 import { uploadEventImage, eventsUploadDir } from '../uploads';
 import { env } from '../env';
@@ -474,10 +476,30 @@ eventsRouter.patch('/registrations/:id/status', requireAdminRole, async (req, re
  */
 eventsRouter.get('/registrations/:id/status', requireAuth, async (req, res, next) => {
   try {
-    const registration = await prisma.eventRegistration.findUnique({ where: { id: parseId(req.params.id) } });
+    let registration = await prisma.eventRegistration.findUnique({ where: { id: parseId(req.params.id) } });
     if (!registration) throw new ApiError(404, 'Registration not found');
     if (registration.userId !== req.user!.id) throw new ApiError(403, 'Not your registration');
-    res.json({ status: registration.status });
+
+    // Fallback for a callback that hasn't (or, on localhost, can't) land —
+    // actively ask Safaricom on every poll while still pending payment.
+    if (registration.status === 'pending_payment' && registration.paymentRef && paymentProvider.queryStatus) {
+      const result = await paymentProvider.queryStatus(registration.paymentRef);
+      if (result) {
+        registration = await applyMpesaResultToRegistration(registration, result);
+      }
+    }
+
+    // No TicketStatus value represents "failed" (only pending_payment stays
+    // put after a decline, so the customer can retry) — a stored, non-zero
+    // result code is the real signal that a specific attempt already failed.
+    const paymentFailed = registration.paymentResultCode !== null && registration.paymentResultCode !== 0;
+    res.json({
+      status: registration.status,
+      paymentFailed,
+      paymentFailureReason: paymentFailed
+        ? describeMpesaResult(registration.paymentResultCode!, registration.paymentResultDesc ?? '')
+        : undefined,
+    });
   } catch (err) {
     next(err);
   }
@@ -511,7 +533,9 @@ eventsRouter.post('/registrations/:id/retry-payment', requireAuth, publicWriteLi
 
     const updated = await prisma.eventRegistration.update({
       where: { id: registration.id },
-      data: { paymentRef: payment.reference },
+      // Clear the previous attempt's result so the old failure reason
+      // doesn't linger on screen while this fresh STK push is in flight.
+      data: { paymentRef: payment.reference, paymentResultCode: null, paymentResultDesc: null },
       include: { user: { select: { email: true } } },
     });
     res.json({ registration: serializeRegistration(updated), payment });

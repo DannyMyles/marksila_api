@@ -1,6 +1,6 @@
 import { env } from '../env';
 import { ApiError } from '../middleware/errorHandler';
-import { InitiatePaymentInput, InitiatePaymentResult, PaymentProvider } from './PaymentProvider';
+import { InitiatePaymentInput, InitiatePaymentResult, PaymentProvider, PaymentQueryResult } from './PaymentProvider';
 
 const BASE_URLS: Record<string, string> = {
   sandbox: 'https://sandbox.safaricom.co.ke',
@@ -107,5 +107,56 @@ export class DarajaMpesaProvider implements PaymentProvider {
       reference: data.CheckoutRequestID,
       message: `Enter your M-Pesa PIN on your phone (${input.phone}) to complete payment.`,
     };
+  }
+
+  async queryStatus(reference: string): Promise<PaymentQueryResult | null> {
+    try {
+      const token = await this.getAccessToken();
+      const timestamp = new Date()
+        .toISOString()
+        .replace(/[^0-9]/g, '')
+        .slice(0, 14);
+
+      const res = await fetch(`${this.baseUrl()}/mpesa/stkpushquery/v1/query`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          BusinessShortCode: env.mpesaShortcode,
+          Password: this.buildPassword(timestamp),
+          Timestamp: timestamp,
+          CheckoutRequestID: reference,
+        }),
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        ResultCode?: string | number;
+        ResultDesc?: string;
+        errorCode?: string;
+      };
+
+      if (data.ResultCode === undefined || data.ResultCode === null) {
+        // "Still processing" (errorCode 500.001.1001) or "unknown request" —
+        // neither is a definitive answer, so keep polling.
+        return null;
+      }
+
+      const resultCode = Number(data.ResultCode);
+      // 4999 is an undocumented Safaricom sentinel meaning "still
+      // processing" — confirmed empirically (not a real outcome code, and
+      // absent from Safaricom's published ResultCode list). Query can
+      // return this for an extended period during congestion; treating it
+      // as a definitive failure would wrongly fail a payment still in
+      // flight, so it's treated the same as "no answer yet".
+      if (resultCode === 4999) {
+        return null;
+      }
+
+      return { resultCode, resultDesc: data.ResultDesc ?? '' };
+    } catch {
+      return null;
+    }
   }
 }

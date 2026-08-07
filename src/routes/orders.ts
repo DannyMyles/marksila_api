@@ -5,6 +5,8 @@ import { requireAdminKey } from '../middleware/adminAuth';
 import { optionalAuth, requireAuth } from '../middleware/userAuth';
 import { generateOrderNumber } from '../utils/orderNumber';
 import { paymentProvider } from '../payments';
+import { describeMpesaResult } from '../payments/mpesaResultCodes';
+import { applyMpesaResultToOrder } from '../payments/applyMpesaResult';
 import { ApiError } from '../middleware/errorHandler';
 import { sendMail, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
 import { env } from '../env';
@@ -40,6 +42,9 @@ function serializeOrder(order: any) {
     paymentMethod: order.paymentMethod,
     paymentStatus: order.paymentStatus,
     paymentRef: order.paymentRef,
+    // Admin-visible raw Safaricom result, so a failed payment isn't a mystery.
+    paymentResultCode: order.paymentResultCode,
+    paymentResultDesc: order.paymentResultDesc,
     subtotal: order.subtotal,
     shipping: order.total - order.subtotal,
     total: order.total,
@@ -81,11 +86,7 @@ ordersRouter.post('/', publicWriteLimiter, optionalAuth, async (req, res, next) 
       const product = productById.get(item.productId)!;
       return sum + product.price * item.quantity;
     }, 0);
-    // Flat shipping fee, free above KES 5000 — must match CartClient.tsx's
-    // identical threshold so the amount displayed pre-checkout matches the
-    // amount actually charged via M-Pesa.
-    const shipping = subtotal > 5000 ? 0 : 500;
-    const total = subtotal + shipping;
+    const total = subtotal;
 
     const orderNumber = generateOrderNumber();
     const payment = await paymentProvider.initiate({
@@ -226,10 +227,27 @@ ordersRouter.get('/:id', requireAdminKey, async (req, res, next) => {
  */
 ordersRouter.get('/:id/status', requireAuth, async (req, res, next) => {
   try {
-    const order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
+    let order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
     if (!order) throw new ApiError(404, 'Order not found');
     if (order.userId !== req.user!.id) throw new ApiError(403, 'Not your order');
-    res.json({ status: order.status, paymentStatus: order.paymentStatus });
+
+    // Fallback for a callback that hasn't (or, on localhost, can't) land —
+    // actively ask Safaricom on every poll while the order is still pending.
+    if (order.paymentStatus === 'pending' && order.paymentRef && paymentProvider.queryStatus) {
+      const result = await paymentProvider.queryStatus(order.paymentRef);
+      if (result) {
+        order = await applyMpesaResultToOrder(order, result);
+      }
+    }
+
+    res.json({
+      status: order.status,
+      paymentStatus: order.paymentStatus,
+      paymentFailureReason:
+        order.paymentStatus === 'failed' && order.paymentResultCode !== null
+          ? describeMpesaResult(order.paymentResultCode, order.paymentResultDesc ?? '')
+          : undefined,
+    });
   } catch (err) {
     next(err);
   }
@@ -258,7 +276,9 @@ ordersRouter.post('/:id/retry-payment', requireAuth, publicWriteLimiter, async (
 
     const updated = await prisma.order.update({
       where: { id: order.id },
-      data: { paymentStatus: payment.status, paymentRef: payment.reference },
+      // Clear the previous attempt's result so the old failure reason
+      // doesn't linger on screen while this fresh STK push is in flight.
+      data: { paymentStatus: payment.status, paymentRef: payment.reference, paymentResultCode: null, paymentResultDesc: null },
       include: { items: true },
     });
     res.json({ order: serializeOrder(updated), payment });
