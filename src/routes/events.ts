@@ -66,6 +66,7 @@ function serializeRegistration(reg: any) {
     attendeeEmail: reg.user?.email,
     status: reg.status,
     paymentRef: reg.paymentRef,
+    checkedInAt: reg.checkedInAt,
     createdAt: reg.createdAt,
   };
 }
@@ -285,6 +286,52 @@ eventsRouter.get('/:id/registrations', requireAdminRole, async (req, res, next) 
       orderBy: { createdAt: 'desc' },
     });
     res.json({ registrations: registrations.map(serializeRegistration) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const checkinSchema = z.object({
+  ticketNumber: z.string().trim().min(1).max(50),
+});
+
+/**
+ * @openapi
+ * /api/v1/events/{id}/registrations/checkin:
+ *   post:
+ *     summary: Check a ticket in at the door, by ticket number (scanned QR or typed) (admin)
+ *     tags: [Events]
+ *     security: [{ BearerAuth: [] }]
+ */
+eventsRouter.post('/:id/registrations/checkin', requireAdminRole, async (req, res, next) => {
+  try {
+    const input = checkinSchema.parse(req.body);
+    const eventId = parseId(req.params.id);
+
+    const registration = await prisma.eventRegistration.findFirst({
+      where: { ticketNumber: input.ticketNumber, eventId },
+      include: { user: { select: { email: true } } },
+    });
+    if (!registration) {
+      throw new ApiError(404, 'No ticket with that number was found for this event.');
+    }
+
+    if (registration.status === 'cancelled') {
+      return res.json({ registration: serializeRegistration(registration), outcome: 'blocked_cancelled' });
+    }
+    if (registration.status === 'pending_payment') {
+      return res.json({ registration: serializeRegistration(registration), outcome: 'blocked_unpaid' });
+    }
+    if (registration.checkedInAt) {
+      return res.json({ registration: serializeRegistration(registration), outcome: 'already_checked_in' });
+    }
+
+    const updated = await prisma.eventRegistration.update({
+      where: { id: registration.id },
+      data: { checkedInAt: new Date() },
+      include: { user: { select: { email: true } } },
+    });
+    res.json({ registration: serializeRegistration(updated), outcome: 'checked_in' });
   } catch (err) {
     next(err);
   }

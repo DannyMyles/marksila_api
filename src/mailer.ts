@@ -78,7 +78,10 @@ function iconBadge(emoji: string): string {
  * (Gmail, Apple Mail, Outlook web) renders that fine, and it keeps
  * nodemailer's `html` option simple.
  */
-function wrap(bodyHtml: string, { center = false }: { center?: boolean } = {}): string {
+function wrap(
+  bodyHtml: string,
+  { center = false, unsubscribeUrl }: { center?: boolean; unsubscribeUrl?: string } = {}
+): string {
   const year = new Date().getFullYear();
   return `
     <div style="background:radial-gradient(circle at 15% 0%,rgba(255,107,53,0.12),transparent 55%),radial-gradient(circle at 85% 100%,rgba(212,74,27,0.10),transparent 55%),#f1f1f4;padding:40px 14px;font-family:${FONT_STACK};">
@@ -94,6 +97,7 @@ function wrap(bodyHtml: string, { center = false }: { center?: boolean } = {}): 
           <p style="margin:0 0 6px;color:#f1f5f9;font-weight:700;font-size:14px;letter-spacing:0.02em;">MarkSila254 Active Wear</p>
           <p style="margin:0 0 4px;">Nairobi, Kenya &middot; <a href="tel:+254701437959" style="color:#94a3b8;text-decoration:none;">+254 701 437 959</a> &middot; <a href="mailto:markotundo777@gmail.com" style="color:#94a3b8;text-decoration:none;">markotundo777@gmail.com</a></p>
           <p style="margin:16px 0 0;color:#64748b;">&copy; ${year} MarkSila254. All rights reserved.</p>
+          ${unsubscribeUrl ? `<p style="margin:10px 0 0;"><a href="${unsubscribeUrl}" style="color:#64748b;text-decoration:underline;">Unsubscribe from these emails</a></p>` : ''}
         </div>
       </div>
     </div>
@@ -351,5 +355,31 @@ export function orderStatusUpdateEmail(data: {
       <p style="margin:0 0 20px;text-align:center;">${statusBadge(data.status)}</p>
       <p style="color:#64748b;margin:0;text-align:center;font-size:14px;">Order total: <strong style="color:${INK};">KES ${data.total.toLocaleString()}</strong></p>
     `),
+  };
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+export function newsletterCampaignEmail(data: {
+  subject: string;
+  message: string;
+  unsubscribeUrl: string;
+}): { subject: string; html: string } {
+  const paragraphs = data.message
+    .split(/\n{2,}/)
+    .map((p) => `<p style="margin:0 0 16px;">${escapeHtml(p).replace(/\n/g, '<br/>')}</p>`)
+    .join('');
+  return {
+    subject: data.subject,
+    html: wrap(
+      `
+      ${iconBadge('📰')}
+      <h2 style="margin:0 0 20px;font-size:22px;font-weight:800;text-align:center;">${escapeHtml(data.subject)}</h2>
+      <div style="font-size:14px;color:${INK};">${paragraphs}</div>
+    `,
+      { unsubscribeUrl: data.unsubscribeUrl }
+    ),
   };
 }

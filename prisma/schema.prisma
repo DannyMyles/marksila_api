@@ -272,6 +272,11 @@ model EventRegistration {
   mpesaPhone            String?
   mpesaAmount           Int?
   mpesaTransactionTime  DateTime?
+  // Set the moment a door-staff scan/manual lookup successfully checks this
+  // ticket in — null means "not checked in yet". Deliberately just a
+  // timestamp (no separate boolean) so "checked in" and "when" are the same
+  // fact, can't drift apart.
+  checkedInAt   DateTime?
   createdAt     DateTime     @default(now())
 
   @@unique([eventId, userId])
