@@ -32,4 +32,9 @@ export const env = {
   mpesaShortcode: process.env.MPESA_SHORTCODE ?? '',
   mpesaPasskey: process.env.MPESA_PASSKEY ?? '',
   mpesaCallbackUrl: process.env.MPESA_CALLBACK_URL ?? '',
+  // YouTube video sync is intentionally optional at startup, same pattern as
+  // M-Pesa above — src/services/youtube.ts checks this and the route
+  // returns an empty list rather than failing if unset.
+  youtubeApiKey: process.env.YOUTUBE_API_KEY ?? '',
+  youtubeChannelHandle: process.env.YOUTUBE_CHANNEL_HANDLE ?? 'marksila254',
 };

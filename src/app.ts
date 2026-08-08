@@ -18,6 +18,7 @@ import { eventsRouter } from './routes/events';
 import { galleryRouter } from './routes/gallery';
 import { newsletterRouter } from './routes/newsletter';
 import { mpesaRouter } from './routes/mpesa';
+import { youtubeRouter } from './routes/youtube';
 import { uploadsRoot } from './uploads';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 
@@ -55,6 +56,7 @@ app.use('/api/v1/events', eventsRouter);
 app.use('/api/v1/gallery', galleryRouter);
 app.use('/api/v1/newsletter', newsletterRouter);
 app.use('/api/v1/mpesa', mpesaRouter);
+app.use('/api/v1/youtube', youtubeRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
