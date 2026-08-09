@@ -91,20 +91,23 @@ model Testimonial {
 }
 
 model Training {
-  id          Int      @id @default(autoincrement())
-  title       String
-  slug        String?  @unique
-  description String   @db.Text
-  features    String   @db.Text // JSON-encoded string[]
-  price       String
-  image       String
-  icon        String?
-  color       String?
-  popular     Boolean  @default(false)
-  order       Int      @default(0)
-  published   Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id               Int      @id @default(autoincrement())
+  title            String
+  slug             String?  @unique
+  description      String   @db.Text
+  features         String   @db.Text // JSON-encoded string[]
+  price            String
+  imageUrl         String?  @db.VarChar(512)
+  imageFilename    String?
+  imageContentType String?
+  imageSize        Int?
+  icon             String?
+  color            String?
+  popular          Boolean  @default(false)
+  order            Int      @default(0)
+  published        Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 }
 
 model Category {

@@ -54,3 +54,7 @@ export const uploadGalleryImages = galleryUploads.uploader;
 const productUploads = createImageUploader('products');
 export const productsUploadDir = productUploads.dir;
 export const uploadProductImages = productUploads.uploader;
+
+const trainingUploads = createImageUploader('trainings');
+export const trainingsUploadDir = trainingUploads.dir;
+export const uploadTrainingImage = trainingUploads.uploader;
