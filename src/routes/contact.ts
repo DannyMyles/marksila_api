@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { env } from '../env';
+import { mailBrandFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
 import { ApiError } from '../middleware/errorHandler';
 import { sendMail, contactNotificationEmail } from '../mailer';
 import { phoneSchema } from '../utils/validation';
@@ -25,12 +25,14 @@ const contactSchema = z.object({
  */
 contactRouter.post('/', publicWriteLimiter, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = contactSchema.parse(req.body);
-    const { subject, html } = contactNotificationEmail(input);
+    const { subject, html } = contactNotificationEmail({ ...input, email: input.email || undefined });
 
     try {
       await sendMail({
-        to: env.adminNotificationEmail,
+        to: notificationEmailFor(tenant),
+        brand: mailBrandFor(tenant),
         subject,
         html,
         replyTo: input.email || undefined,

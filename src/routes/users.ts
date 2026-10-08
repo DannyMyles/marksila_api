@@ -5,10 +5,16 @@ import { prisma } from '../prisma';
 import { requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { parseId, passwordSchema } from '../utils/validation';
+import { tenantOf } from '../middleware/tenant';
 
 export const usersRouter = Router();
 
 usersRouter.use(requireAdminRole);
+
+async function assertOwnUser(appId: number, id: number) {
+  const user = await prisma.user.findFirst({ where: { id, appId }, select: { id: true } });
+  if (!user) throw new ApiError(404, 'User not found');
+}
 
 function roleDisplayName(role: string): string {
   return role === 'admin' ? 'Administrator' : 'User';
@@ -37,9 +43,9 @@ function serializeUser(u: any) {
  *     tags: [Users]
  *     security: [{ BearerAuth: [] }]
  */
-usersRouter.get('/', async (_req, res, next) => {
+usersRouter.get('/', async (req, res, next) => {
   try {
-    const users = await prisma.user.findMany({ orderBy: { createdAt: 'desc' } });
+    const users = await prisma.user.findMany({ where: { appId: tenantOf(req).id }, orderBy: { createdAt: 'desc' } });
     res.json({ users: users.map(serializeUser) });
   } catch (err) {
     next(err);
@@ -48,7 +54,7 @@ usersRouter.get('/', async (_req, res, next) => {
 
 usersRouter.get('/:id', async (req, res, next) => {
   try {
-    const user = await prisma.user.findUnique({ where: { id: parseId(req.params.id) } });
+    const user = await prisma.user.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!user) throw new ApiError(404, 'User not found');
     res.json({ user: serializeUser(user) });
   } catch (err) {
@@ -70,16 +76,18 @@ const createUserSchema = z.object({
 
 usersRouter.post('/', async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = createUserSchema.parse(req.body);
 
     const existing = await prisma.user.findFirst({
-      where: { OR: [{ email: input.email }, { username: input.username }] },
+      where: { appId, OR: [{ email: input.email }, { username: input.username }] },
     });
     if (existing) throw new ApiError(409, 'An account with that email or username already exists');
 
     const passwordHash = await bcrypt.hash(input.password, 10);
     const user = await prisma.user.create({
       data: {
+        appId,
         name: input.name,
         username: input.username,
         email: input.email,
@@ -107,6 +115,10 @@ usersRouter.put('/:id', async (req, res, next) => {
   try {
     const input = updateUserSchema.parse(req.body);
     const id = parseId(req.params.id);
+    await assertOwnUser(tenantOf(req).id, id);
+    if (id === req.user!.id && (input.isActive === false || input.roleId === 'user')) {
+      throw new ApiError(400, "You can't deactivate or demote your own account");
+    }
 
     const data: Record<string, unknown> = {
       name: input.name,
@@ -126,7 +138,10 @@ usersRouter.put('/:id', async (req, res, next) => {
 
 usersRouter.delete('/:id', async (req, res, next) => {
   try {
-    await prisma.user.delete({ where: { id: parseId(req.params.id) } });
+    const id = parseId(req.params.id);
+    await assertOwnUser(tenantOf(req).id, id);
+    if (id === req.user!.id) throw new ApiError(400, "You can't delete your own account");
+    await prisma.user.delete({ where: { id } });
     res.status(204).send();
   } catch (err) {
     next(err);

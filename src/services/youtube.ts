@@ -13,16 +13,18 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
-let cache: CacheEntry | null = null;
-let uploadsPlaylistId: string | null = null;
+// Keyed by channel handle — each app shows its own channel (App.youtubeChannelHandle).
+const cache = new Map<string, CacheEntry>();
+const uploadsPlaylistIds = new Map<string, string>();
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour — video lists don't change often enough to warrant refetching every request, and this keeps us well under the API's daily quota.
 
 const API_BASE = 'https://www.googleapis.com/youtube/v3';
 
-async function getUploadsPlaylistId(): Promise<string> {
-  if (uploadsPlaylistId) return uploadsPlaylistId;
+async function getUploadsPlaylistId(handle: string): Promise<string> {
+  const known = uploadsPlaylistIds.get(handle);
+  if (known) return known;
 
-  const url = `${API_BASE}/channels?part=contentDetails&forHandle=${encodeURIComponent(env.youtubeChannelHandle)}&key=${env.youtubeApiKey}`;
+  const url = `${API_BASE}/channels?part=contentDetails&forHandle=${encodeURIComponent(handle)}&key=${env.youtubeApiKey}`;
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`YouTube channel lookup failed: ${res.status} ${await res.text()}`);
@@ -32,9 +34,9 @@ async function getUploadsPlaylistId(): Promise<string> {
   };
   const playlistId = data.items?.[0]?.contentDetails.relatedPlaylists.uploads;
   if (!playlistId) {
-    throw new Error(`No channel found for handle "${env.youtubeChannelHandle}"`);
+    throw new Error(`No channel found for handle "${handle}"`);
   }
-  uploadsPlaylistId = playlistId;
+  uploadsPlaylistIds.set(handle, playlistId);
   return playlistId;
 }
 
@@ -51,8 +53,8 @@ interface PlaylistItemsPage {
   nextPageToken?: string;
 }
 
-async function fetchAllVideos(): Promise<YoutubeVideo[]> {
-  const playlistId = await getUploadsPlaylistId();
+async function fetchAllVideos(handle: string): Promise<YoutubeVideo[]> {
+  const playlistId = await getUploadsPlaylistId(handle);
   const videos: YoutubeVideo[] = [];
   let pageToken: string | undefined;
 
@@ -97,22 +99,23 @@ async function fetchAllVideos(): Promise<YoutubeVideo[]> {
  * cache is simply refreshed lazily on whichever request happens to land
  * after it expires.
  */
-export async function getChannelVideos(): Promise<YoutubeVideo[]> {
-  if (!env.youtubeApiKey) return [];
+export async function getChannelVideos(handle: string | null | undefined): Promise<YoutubeVideo[]> {
+  if (!env.youtubeApiKey || !handle) return [];
 
-  if (cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
-    return cache.videos;
+  const cached = cache.get(handle);
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.videos;
   }
 
   try {
-    const videos = await fetchAllVideos();
-    cache = { videos, fetchedAt: Date.now() };
+    const videos = await fetchAllVideos(handle);
+    cache.set(handle, { videos, fetchedAt: Date.now() });
     return videos;
   } catch (err) {
     // A transient YouTube API hiccup (or a quota bump) shouldn't take the
     // gallery page down — serve the last known-good list if there is one,
     // otherwise an empty list, and let the next request retry.
     console.error('[youtube] Failed to refresh video list:', err);
-    return cache?.videos ?? [];
+    return cache.get(handle)?.videos ?? [];
   }
 }

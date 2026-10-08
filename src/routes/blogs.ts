@@ -1,12 +1,14 @@
 import { Router } from 'express';
-import path from 'path';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { slugify } from '../utils/slugify';
-import { uploadBlogImage, blogsUploadDir } from '../uploads';
+import { uploadBlogImage, uploadPath, removeUpload } from '../uploads';
+import { tenantOf } from '../middleware/tenant';
+import { assertOwned, uniqueSlugFor } from '../utils/tenantScope';
+import { optionalAuth } from '../middleware/userAuth';
 import { parseId, urlOrPathSchema } from '../utils/validation';
 
 export const blogsRouter = Router();
@@ -63,7 +65,7 @@ blogsRouter.get('/', async (req, res, next) => {
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 12));
     const { category, featured, search, sort } = req.query as Record<string, string | undefined>;
 
-    const where: Prisma.BlogWhereInput = { published: true };
+    const where: Prisma.BlogWhereInput = { appId: tenantOf(req).id, published: true };
     if (category) where.category = category;
     if (featured !== undefined) where.featured = featured === 'true';
     if (search) {
@@ -104,10 +106,10 @@ blogsRouter.get('/', async (req, res, next) => {
   }
 });
 
-blogsRouter.get('/featured', async (_req, res, next) => {
+blogsRouter.get('/featured', async (req, res, next) => {
   try {
     const blogs = await prisma.blog.findMany({
-      where: { published: true, featured: true },
+      where: { appId: tenantOf(req).id, published: true, featured: true },
       orderBy: { createdAt: 'desc' },
     });
     res.json({ blogs: blogs.map(serializeBlog) });
@@ -116,9 +118,9 @@ blogsRouter.get('/featured', async (_req, res, next) => {
   }
 });
 
-blogsRouter.get('/categories', async (_req, res, next) => {
+blogsRouter.get('/categories', async (req, res, next) => {
   try {
-    const blogs = await prisma.blog.findMany({ where: { published: true }, select: { category: true } });
+    const blogs = await prisma.blog.findMany({ where: { appId: tenantOf(req).id, published: true }, select: { category: true } });
     const counts = new Map<string, number>();
     for (const b of blogs) counts.set(b.category, (counts.get(b.category) ?? 0) + 1);
     res.json({ categories: Array.from(counts, ([name, count]) => ({ name, count })) });
@@ -127,9 +129,9 @@ blogsRouter.get('/categories', async (_req, res, next) => {
   }
 });
 
-blogsRouter.get('/stats', async (_req, res, next) => {
+blogsRouter.get('/stats', requireAdminRole, async (req, res, next) => {
   try {
-    const blogs = await prisma.blog.findMany();
+    const blogs = await prisma.blog.findMany({ where: { appId: tenantOf(req).id } });
     const withImages = blogs.filter((b) => b.imageFilename || b.imageUrl);
     const sizes = withImages.map((b) => b.imageSize ?? 0).filter((s) => s > 0);
     const totalImageSize = sizes.reduce((sum, s) => sum + s, 0);
@@ -147,10 +149,12 @@ blogsRouter.get('/stats', async (_req, res, next) => {
   }
 });
 
-blogsRouter.get('/slug/:slug', async (req, res, next) => {
+blogsRouter.get('/slug/:slug', optionalAuth, async (req, res, next) => {
   try {
-    const blog = await prisma.blog.findUnique({ where: { slug: req.params.slug } });
-    if (!blog) throw new ApiError(404, 'Blog not found');
+    const blog = await prisma.blog.findUnique({
+      where: { appId_slug: { appId: tenantOf(req).id, slug: req.params.slug } },
+    });
+    if (!blog || (!blog.published && req.user?.role !== 'admin')) throw new ApiError(404, 'Blog not found');
     res.json({ blog: serializeBlog(blog) });
   } catch (err) {
     next(err);
@@ -159,10 +163,10 @@ blogsRouter.get('/slug/:slug', async (req, res, next) => {
 
 blogsRouter.get('/:id/image', async (req, res, next) => {
   try {
-    const blog = await prisma.blog.findUnique({ where: { id: parseId(req.params.id) } });
+    const blog = await prisma.blog.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!blog) throw new ApiError(404, 'Blog not found');
     if (blog.imageFilename) {
-      return res.sendFile(path.join(blogsUploadDir, blog.imageFilename));
+      return res.sendFile(uploadPath(req, 'blogs', blog.imageFilename));
     }
     if (blog.imageUrl) {
       return res.redirect(302, blog.imageUrl);
@@ -175,7 +179,7 @@ blogsRouter.get('/:id/image', async (req, res, next) => {
 
 blogsRouter.get('/:id/image-info', async (req, res, next) => {
   try {
-    const blog = await prisma.blog.findUnique({ where: { id: parseId(req.params.id) } });
+    const blog = await prisma.blog.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!blog) throw new ApiError(404, 'Blog not found');
     res.json(imageInfoFor(blog));
   } catch (err) {
@@ -185,8 +189,10 @@ blogsRouter.get('/:id/image-info', async (req, res, next) => {
 
 blogsRouter.post('/:id/like', async (req, res, next) => {
   try {
+    const id = parseId(req.params.id);
+    await assertOwned(prisma.blog, tenantOf(req).id, id, 'Blog');
     const blog = await prisma.blog.update({
-      where: { id: parseId(req.params.id) },
+      where: { id },
       data: { likes: { increment: 1 } },
     });
     res.json({ likes: blog.likes });
@@ -197,7 +203,7 @@ blogsRouter.post('/:id/like', async (req, res, next) => {
 
 blogsRouter.get('/:id', async (req, res, next) => {
   try {
-    const blog = await prisma.blog.findUnique({ where: { id: parseId(req.params.id) } });
+    const blog = await prisma.blog.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!blog) throw new ApiError(404, 'Blog not found');
     res.json({ blog: serializeBlog(blog) });
   } catch (err) {
@@ -234,15 +240,8 @@ function parseTags(raw: string | undefined): string | undefined {
   }
 }
 
-async function uniqueSlug(title: string, excludeId?: number): Promise<string> {
-  const base = slugify(title);
-  let slug = base;
-  let n = 1;
-  while (await prisma.blog.findFirst({ where: { slug, ...(excludeId ? { id: { not: excludeId } } : {}) } })) {
-    slug = `${base}-${++n}`;
-  }
-  return slug;
-}
+const uniqueSlug = (appId: number, title: string, excludeId?: number) =>
+  uniqueSlugFor(prisma.blog, appId, slugify(title), excludeId);
 
 /**
  * @openapi
@@ -254,12 +253,14 @@ async function uniqueSlug(title: string, excludeId?: number): Promise<string> {
  */
 blogsRouter.post('/', requireAdminRole, uploadBlogImage.single('image'), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = blogFormSchema.parse(req.body);
-    const slug = await uniqueSlug(input.title);
+    const slug = await uniqueSlug(appId, input.title);
     const file = req.file;
 
     const blog = await prisma.blog.create({
       data: {
+        appId,
         title: input.title,
         slug,
         excerpt: input.excerpt,
@@ -290,15 +291,22 @@ const blogUpdateFormSchema = blogFormSchema.partial();
 
 blogsRouter.put('/:id', requireAdminRole, uploadBlogImage.single('image'), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = blogUpdateFormSchema.parse(req.body);
     const id = parseId(req.params.id);
     const file = req.file;
+    const existing = await prisma.blog.findFirst({ where: { id, appId } });
+    if (!existing) {
+      removeUpload(req, 'blogs', file?.filename);
+      throw new ApiError(404, 'Blog not found');
+    }
 
     const data: Record<string, unknown> = {
       ...input,
       tags: parseTags(input.tags),
     };
-    if (input.title) data.slug = await uniqueSlug(input.title, id);
+    if (input.title) data.slug = await uniqueSlug(appId, input.title, id);
+    if (file || input.imageUrl) removeUpload(req, 'blogs', existing.imageFilename);
     if (file) {
       data.imageFilename = file.filename;
       data.imageContentType = file.mimetype;
@@ -320,7 +328,11 @@ blogsRouter.put('/:id', requireAdminRole, uploadBlogImage.single('image'), async
 
 blogsRouter.delete('/:id', requireAdminRole, async (req, res, next) => {
   try {
-    await prisma.blog.delete({ where: { id: parseId(req.params.id) } });
+    const id = parseId(req.params.id);
+    const blog = await prisma.blog.findFirst({ where: { id, appId: tenantOf(req).id } });
+    if (!blog) throw new ApiError(404, 'Blog not found');
+    await prisma.blog.delete({ where: { id } });
+    removeUpload(req, 'blogs', blog.imageFilename);
     res.status(204).send();
   } catch (err) {
     next(err);

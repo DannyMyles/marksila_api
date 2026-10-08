@@ -1,36 +1,48 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
 import { optionalAuth, requireAuth } from '../middleware/userAuth';
-import { generateOrderNumber } from '../utils/orderNumber';
-import { paymentProvider } from '../payments';
-import { describeMpesaResult } from '../payments/mpesaResultCodes';
-import { applyMpesaResultToOrder } from '../payments/applyMpesaResult';
+import { mailBrandFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
 import { ApiError } from '../middleware/errorHandler';
-import { sendMail, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
-import { env } from '../env';
+import { sendMailInBackground, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
 import { parseId, phoneSchema } from '../utils/validation';
+import { generateReference } from '../utils/reference';
+import { orderWhatsApp } from '../services/whatsapp';
 import { publicWriteLimiter } from '../middleware/rateLimiters';
 
 export const ordersRouter = Router();
 
 const orderItemSchema = z.object({
   productId: z.number().int().positive(),
-  quantity: z.number().int().positive().max(100),
-  size: z.string().max(50).optional(),
-  color: z.string().max(50).optional(),
+  quantity: z.number().int().positive().max(50),
+  size: z.string().trim().max(50).optional(),
+  color: z.string().trim().max(50).optional(),
 });
 
+const optionalText = (max: number) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .optional()
+    .transform((v) => (v ? v : undefined));
+
+// One short form: name, phone, where to deliver. Email/notes are optional —
+// the order is confirmed with the customer on WhatsApp, not by email.
 const createOrderSchema = z.object({
   customerName: z.string().trim().min(1).max(100),
-  customerEmail: z.string().trim().email().max(255),
   customerPhone: phoneSchema,
+  customerEmail: z.string().trim().email().max(255).optional().or(z.literal('')).transform((v) => v || undefined),
   shippingAddress: z.string().trim().min(1).max(500),
-  items: z.array(orderItemSchema).min(1).max(100),
+  notes: optionalText(500),
+  items: z.array(orderItemSchema).min(1).max(50),
 });
 
-function serializeOrder(order: any) {
+type OrderWithItems = Prisma.OrderGetPayload<{ include: { items: true } }>;
+
+function serializeOrder(order: OrderWithItems) {
   return {
     id: order.id,
     orderNumber: order.orderNumber,
@@ -38,39 +50,15 @@ function serializeOrder(order: any) {
     customerEmail: order.customerEmail,
     customerPhone: order.customerPhone,
     shippingAddress: order.shippingAddress,
+    notes: order.notes,
     status: order.status,
-    paymentMethod: order.paymentMethod,
     paymentStatus: order.paymentStatus,
-    paymentRef: order.paymentRef,
-    // Admin-visible raw Safaricom result, so a failed payment isn't a mystery.
-    paymentResultCode: order.paymentResultCode,
-    paymentResultDesc: order.paymentResultDesc,
-    // Full M-Pesa transaction detail for a successful payment. Only ever
-    // populated from a delivered STK callback (the STK Query fallback used
-    // for local/sandbox polling has no equivalent data to offer) — null
-    // until then. billRefNumber/transactionId/businessShortCode/
-    // transactionType aren't separate stored fields: this app always
-    // initiates as CustomerPayBillOnline against a single configured
-    // shortcode, and the STK push's own AccountReference is always the
-    // order number, so those are reported directly rather than duplicated
-    // in the database per-order.
-    mpesa: order.paymentRef
-      ? {
-          billReferenceNumber: order.orderNumber,
-          phoneNumber: order.mpesaPhone,
-          firstName: order.customerName,
-          transactionAmount: order.mpesaAmount,
-          transactionId: order.paymentStatus === 'paid' ? order.paymentRef : null,
-          transactionType: 'CustomerPayBillOnline',
-          transactionTime: order.mpesaTransactionTime,
-          businessShortCode: env.mpesaShortcode,
-        }
-      : null,
     subtotal: order.subtotal,
     shipping: order.total - order.subtotal,
     total: order.total,
     createdAt: order.createdAt,
-    items: (order.items ?? []).map((i: any) => ({
+    updatedAt: order.updatedAt,
+    items: order.items.map((i) => ({
       id: i.id,
       productId: i.productId,
       name: i.name,
@@ -86,91 +74,103 @@ function serializeOrder(order: any) {
  * @openapi
  * /api/orders:
  *   post:
- *     summary: Create an order (checkout). Guest checkout — no auth required.
+ *     summary: Place an order (guest or logged in). Prices come from the database; the response includes a WhatsApp link with the order summary.
  *     tags: [Orders]
+ *     parameters:
+ *       - { in: header, name: X-App-Key, required: true, schema: { type: string } }
  */
 ordersRouter.post('/', publicWriteLimiter, optionalAuth, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = createOrderSchema.parse(req.body);
 
-    const productIds = input.items.map((i) => i.productId);
-    const products = await prisma.product.findMany({ where: { id: { in: productIds } } });
+    // Only products of THIS app can be ordered — an id from another app is
+    // simply "not found".
+    const productIds = [...new Set(input.items.map((i) => i.productId))];
+    const products = await prisma.product.findMany({ where: { id: { in: productIds }, appId: tenant.id } });
     const productById = new Map(products.map((p) => [p.id, p]));
 
     for (const item of input.items) {
       const product = productById.get(item.productId);
-      if (!product) throw new ApiError(400, `Product ${item.productId} not found`);
+      if (!product) throw new ApiError(409, 'An item in your cart is no longer available. Please refresh your cart.');
       if (!product.inStock) throw new ApiError(409, `${product.name} is out of stock`);
     }
 
-    const subtotal = input.items.reduce((sum, item) => {
-      const product = productById.get(item.productId)!;
-      return sum + product.price * item.quantity;
-    }, 0);
-    const total = subtotal;
+    const subtotal = input.items.reduce((sum, item) => sum + productById.get(item.productId)!.price * item.quantity, 0);
+    const total = subtotal; // delivery is agreed on WhatsApp
 
-    const orderNumber = generateOrderNumber();
-    const payment = await paymentProvider.initiate({
-      orderNumber,
-      amount: total,
-      phone: input.customerPhone,
-    });
+    let order: OrderWithItems | null = null;
+    for (let attempt = 0; !order; attempt++) {
+      try {
+        order = await prisma.order.create({
+          data: {
+            appId: tenant.id,
+            orderNumber: generateReference(tenant.orderPrefix),
+            customerName: input.customerName,
+            customerEmail: input.customerEmail,
+            customerPhone: input.customerPhone,
+            shippingAddress: input.shippingAddress,
+            notes: input.notes,
+            subtotal,
+            total,
+            userId: req.user?.id,
+            items: {
+              create: input.items.map((item) => {
+                const product = productById.get(item.productId)!;
+                return {
+                  productId: product.id,
+                  name: product.name,
+                  price: product.price,
+                  quantity: item.quantity,
+                  size: item.size,
+                  color: item.color,
+                };
+              }),
+            },
+          },
+          include: { items: true },
+        });
+      } catch (err) {
+        // Unlucky reference collision — try a fresh one.
+        const dup = err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002';
+        if (!dup || attempt >= 4) throw err;
+      }
+    }
 
-    const order = await prisma.order.create({
-      data: {
-        orderNumber,
-        customerName: input.customerName,
-        customerEmail: input.customerEmail,
-        customerPhone: input.customerPhone,
-        shippingAddress: input.shippingAddress,
-        subtotal,
-        total,
-        paymentStatus: payment.status,
-        paymentRef: payment.reference,
-        userId: req.user?.id,
-        items: {
-          create: input.items.map((item) => {
-            const product = productById.get(item.productId)!;
-            return {
-              productId: product.id,
-              name: product.name,
-              price: product.price,
-              quantity: item.quantity,
-              size: item.size,
-              color: item.color,
-            };
+    const brand = mailBrandFor(tenant);
+    if (order.customerEmail) {
+      sendMailInBackground(
+        {
+          to: order.customerEmail,
+          brand,
+          ...orderConfirmationEmail({
+            orderNumber: order.orderNumber,
+            customerName: order.customerName,
+            items: order.items.map((i) => ({ name: i.name, price: i.price, quantity: i.quantity })),
+            subtotal: order.subtotal,
+            total: order.total,
+            shippingAddress: order.shippingAddress,
           }),
         },
+        `order confirmation ${order.orderNumber}`
+      );
+    }
+    sendMailInBackground(
+      {
+        to: notificationEmailFor(tenant),
+        brand,
+        ...orderAlertEmail({
+          orderNumber: order.orderNumber,
+          customerName: order.customerName,
+          customerPhone: order.customerPhone,
+          customerEmail: order.customerEmail,
+          total: order.total,
+        }),
       },
-      include: { items: true },
-    });
-
-    // Email is a side effect of an already-persisted order — never let a
-    // slow/failed send delay or fail the checkout response.
-    const confirmation = orderConfirmationEmail({
-      orderNumber: order.orderNumber,
-      customerName: order.customerName,
-      items: order.items.map((i) => ({ name: i.name, price: i.price, quantity: i.quantity })),
-      subtotal: order.subtotal,
-      total: order.total,
-      shippingAddress: order.shippingAddress,
-    });
-    sendMail({ to: order.customerEmail, ...confirmation }).catch((err) =>
-      console.error(`[orders] Failed to send confirmation email for ${order.orderNumber}:`, err)
+      `order alert ${order.orderNumber}`
     );
 
-    const alert = orderAlertEmail({
-      orderNumber: order.orderNumber,
-      customerName: order.customerName,
-      customerPhone: order.customerPhone,
-      customerEmail: order.customerEmail,
-      total: order.total,
-    });
-    sendMail({ to: env.adminNotificationEmail, ...alert }).catch((err) =>
-      console.error(`[orders] Failed to send admin alert email for ${order.orderNumber}:`, err)
-    );
-
-    res.status(201).json({ order: serializeOrder(order), payment });
+    res.status(201).json({ order: serializeOrder(order), whatsapp: orderWhatsApp(tenant, order) });
   } catch (err) {
     next(err);
   }
@@ -180,13 +180,14 @@ ordersRouter.post('/', publicWriteLimiter, optionalAuth, async (req, res, next) 
  * @openapi
  * /api/orders:
  *   get:
- *     summary: List all orders (admin)
+ *     summary: List this app's orders (admin)
  *     tags: [Orders]
  *     security: [{ AdminKey: [] }]
  */
-ordersRouter.get('/', requireAdminKey, async (_req, res, next) => {
+ordersRouter.get('/', requireAdminKey, async (req, res, next) => {
   try {
     const orders = await prisma.order.findMany({
+      where: { appId: tenantOf(req).id },
       include: { items: true },
       orderBy: { createdAt: 'desc' },
     });
@@ -198,74 +199,45 @@ ordersRouter.get('/', requireAdminKey, async (_req, res, next) => {
 
 function csvCell(value: unknown): string {
   const str = value === null || value === undefined ? '' : String(value);
-  // Quote whenever needed (comma/quote/newline) and escape embedded quotes
-  // by doubling them, per RFC 4180 — the standard every spreadsheet app
-  // (Excel, Google Sheets, Numbers) expects.
-  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+  // RFC 4180 quoting; also neutralise spreadsheet formula injection from
+  // customer-typed fields (a name starting with "=" etc.).
+  const safe = /^[=+\-@]/.test(str) ? `'${str}` : str;
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 
-const EXPORT_COLUMNS = [
-  'Order Number',
-  'Placed At',
-  'Customer Name',
-  'Customer Email',
-  'Customer Phone',
-  'Order Status',
-  'Payment Status',
-  'Subtotal (KES)',
-  'Total (KES)',
-  'Bill Reference Number',
-  'M-Pesa Phone Number',
-  'Transaction Amount (KES)',
-  'Transaction ID',
-  'Transaction Type',
-  'Transaction Time',
-  'Business Short Code',
-  'Payment Result',
-] as const;
-
-function orderToCsvRow(order: any): string {
-  return EXPORT_COLUMNS.map((col) => {
-    switch (col) {
-      case 'Order Number': return csvCell(order.orderNumber);
-      case 'Placed At': return csvCell(new Date(order.createdAt).toISOString());
-      case 'Customer Name': return csvCell(order.customerName);
-      case 'Customer Email': return csvCell(order.customerEmail);
-      case 'Customer Phone': return csvCell(order.customerPhone);
-      case 'Order Status': return csvCell(order.status);
-      case 'Payment Status': return csvCell(order.paymentStatus);
-      case 'Subtotal (KES)': return csvCell(order.subtotal);
-      case 'Total (KES)': return csvCell(order.total);
-      case 'Bill Reference Number': return csvCell(order.mpesa?.billReferenceNumber);
-      case 'M-Pesa Phone Number': return csvCell(order.mpesa?.phoneNumber);
-      case 'Transaction Amount (KES)': return csvCell(order.mpesa?.transactionAmount);
-      case 'Transaction ID': return csvCell(order.mpesa?.transactionId);
-      case 'Transaction Type': return csvCell(order.mpesa ? order.mpesa.transactionType : '');
-      case 'Transaction Time': return csvCell(order.mpesa?.transactionTime ? new Date(order.mpesa.transactionTime).toISOString() : '');
-      case 'Business Short Code': return csvCell(order.mpesa?.businessShortCode);
-      case 'Payment Result': return csvCell(order.paymentResultDesc);
-      default: return '';
-    }
-  }).join(',');
-}
+const EXPORT_COLUMNS: [string, (o: ReturnType<typeof serializeOrder>) => unknown][] = [
+  ['Order Number', (o) => o.orderNumber],
+  ['Placed At', (o) => new Date(o.createdAt).toISOString()],
+  ['Customer Name', (o) => o.customerName],
+  ['Customer Phone', (o) => o.customerPhone],
+  ['Customer Email', (o) => o.customerEmail],
+  ['Delivery Address', (o) => o.shippingAddress],
+  ['Items', (o) => o.items.map((i) => `${i.name} x${i.quantity}`).join('; ')],
+  ['Order Status', (o) => o.status],
+  ['Payment Status', (o) => o.paymentStatus],
+  ['Total (KES)', (o) => o.total],
+  ['Notes', (o) => o.notes],
+];
 
 /**
  * @openapi
  * /api/orders/export:
  *   get:
- *     summary: Download all orders as a CSV report, including full M-Pesa transaction detail (admin)
+ *     summary: Download this app's orders as CSV (admin)
  *     tags: [Orders]
  *     security: [{ AdminKey: [] }]
  */
-ordersRouter.get('/export', requireAdminKey, async (_req, res, next) => {
+ordersRouter.get('/export', requireAdminKey, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const orders = await prisma.order.findMany({
+      where: { appId: tenant.id },
       include: { items: true },
       orderBy: { createdAt: 'desc' },
     });
-    const rows = orders.map(serializeOrder).map(orderToCsvRow);
-    const csv = [EXPORT_COLUMNS.join(','), ...rows].join('\r\n');
-    const filename = `orders-${new Date().toISOString().slice(0, 10)}.csv`;
+    const rows = orders.map(serializeOrder).map((o) => EXPORT_COLUMNS.map(([, get]) => csvCell(get(o))).join(','));
+    const csv = [EXPORT_COLUMNS.map(([name]) => name).join(','), ...rows].join('\r\n');
+    const filename = `${tenant.key}-orders-${new Date().toISOString().slice(0, 10)}.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csv);
@@ -285,7 +257,7 @@ ordersRouter.get('/export', requireAdminKey, async (_req, res, next) => {
 ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
   try {
     const orders = await prisma.order.findMany({
-      where: { userId: req.user!.id },
+      where: { userId: req.user!.id, appId: tenantOf(req).id },
       include: { items: true },
       orderBy: { createdAt: 'desc' },
     });
@@ -305,8 +277,8 @@ ordersRouter.get('/mine', requireAuth, async (req, res, next) => {
  */
 ordersRouter.get('/:id', requireAdminKey, async (req, res, next) => {
   try {
-    const order = await prisma.order.findUnique({
-      where: { id: parseId(req.params.id) },
+    const order = await prisma.order.findFirst({
+      where: { id: parseId(req.params.id), appId: tenantOf(req).id },
       include: { items: true },
     });
     if (!order) throw new ApiError(404, 'Order not found');
@@ -316,110 +288,45 @@ ordersRouter.get('/:id', requireAdminKey, async (req, res, next) => {
   }
 });
 
-/**
- * @openapi
- * /api/orders/{id}/status:
- *   get:
- *     summary: Get the status of the logged-in customer's own order (for payment polling)
- *     tags: [Orders]
- *     security: [{ BearerAuth: [] }]
- */
-ordersRouter.get('/:id/status', requireAuth, async (req, res, next) => {
-  try {
-    let order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
-    if (!order) throw new ApiError(404, 'Order not found');
-    if (order.userId !== req.user!.id) throw new ApiError(403, 'Not your order');
-
-    // Fallback for a callback that hasn't (or, on localhost, can't) land —
-    // actively ask Safaricom on every poll while the order is still pending.
-    if (order.paymentStatus === 'pending' && order.paymentRef && paymentProvider.queryStatus) {
-      const result = await paymentProvider.queryStatus(order.paymentRef);
-      if (result) {
-        order = await applyMpesaResultToOrder(order, result);
-      }
-    }
-
-    res.json({
-      status: order.status,
-      paymentStatus: order.paymentStatus,
-      paymentFailureReason:
-        order.paymentStatus === 'failed' && order.paymentResultCode !== null
-          ? describeMpesaResult(order.paymentResultCode, order.paymentResultDesc ?? '')
-          : undefined,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * @openapi
- * /api/orders/{id}/retry-payment:
- *   post:
- *     summary: Re-initiate M-Pesa payment for an order whose STK push failed, was cancelled, or timed out
- *     tags: [Orders]
- *     security: [{ BearerAuth: [] }]
- */
-ordersRouter.post('/:id/retry-payment', requireAuth, publicWriteLimiter, async (req, res, next) => {
-  try {
-    const order = await prisma.order.findUnique({ where: { id: parseId(req.params.id) } });
-    if (!order) throw new ApiError(404, 'Order not found');
-    if (order.userId !== req.user!.id) throw new ApiError(403, 'Not your order');
-    if (order.paymentStatus === 'paid') throw new ApiError(409, 'This order is already paid');
-
-    const payment = await paymentProvider.initiate({
-      orderNumber: order.orderNumber,
-      amount: order.total,
-      phone: order.customerPhone,
-    });
-
-    const updated = await prisma.order.update({
-      where: { id: order.id },
-      // Clear the previous attempt's result so the old failure reason
-      // doesn't linger on screen while this fresh STK push is in flight.
-      data: { paymentStatus: payment.status, paymentRef: payment.reference, paymentResultCode: null, paymentResultDesc: null },
-      include: { items: true },
-    });
-    res.json({ order: serializeOrder(updated), payment });
-  } catch (err) {
-    next(err);
-  }
-});
-
 const statusUpdateSchema = z.object({
-  status: z.enum(['pending', 'paid', 'shipped', 'delivered', 'cancelled']).optional(),
-  paymentStatus: z.enum(['pending', 'paid', 'failed']).optional(),
+  status: z.enum(['pending', 'confirmed', 'shipped', 'delivered', 'cancelled']).optional(),
+  paymentStatus: z.enum(['unpaid', 'paid']).optional(),
 });
 
 /**
  * @openapi
  * /api/orders/{id}/status:
  *   patch:
- *     summary: Update order/payment status (admin)
+ *     summary: Update order status and/or record offline payment (admin)
  *     tags: [Orders]
  *     security: [{ AdminKey: [] }]
  */
 ordersRouter.patch('/:id/status', requireAdminKey, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = statusUpdateSchema.parse(req.body);
     if (!input.status && !input.paymentStatus) {
       throw new ApiError(400, 'Provide status and/or paymentStatus');
     }
-    const order = await prisma.order.update({
-      where: { id: parseId(req.params.id) },
-      data: input,
-      include: { items: true },
-    });
+    const id = parseId(req.params.id);
+    const existing = await prisma.order.findFirst({ where: { id, appId: tenant.id } });
+    if (!existing) throw new ApiError(404, 'Order not found');
 
-    if (input.status) {
-      const { subject, html } = orderStatusUpdateEmail({
-        orderNumber: order.orderNumber,
-        customerName: order.customerName,
-        status: order.status,
-        total: order.total,
-      });
-      sendMail({ to: order.customerEmail, subject, html }).catch((err) =>
-        console.error(`[orders] Failed to send status update email for ${order.orderNumber}:`, err)
+    const order = await prisma.order.update({ where: { id }, data: input, include: { items: true } });
+
+    if (input.status && input.status !== existing.status && order.customerEmail) {
+      sendMailInBackground(
+        {
+          to: order.customerEmail,
+          brand: mailBrandFor(tenant),
+          ...orderStatusUpdateEmail({
+            orderNumber: order.orderNumber,
+            customerName: order.customerName,
+            status: order.status,
+            total: order.total,
+          }),
+        },
+        `order status update ${order.orderNumber}`
       );
     }
 

@@ -3,10 +3,10 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { prisma } from '../prisma';
-import { env } from '../env';
 import { ApiError } from '../middleware/errorHandler';
 import { requireAuth, signUserToken, verifyUserToken } from '../middleware/userAuth';
-import { sendMail, passwordResetEmail, verificationEmail } from '../mailer';
+import { sendMailInBackground, passwordResetEmail, verificationEmail } from '../mailer';
+import { frontendUrlFor, mailBrandFor, tenantOf } from '../middleware/tenant';
 import { passwordSchema } from '../utils/validation';
 import { authLimiter } from '../middleware/rateLimiters';
 
@@ -32,10 +32,13 @@ const registerSchema = z.object({
  */
 authRouter.post('/register', authLimiter, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = registerSchema.parse(req.body);
 
+    // Accounts belong to one app: the same email can sign up separately on
+    // Fitness and SOS, and neither login works on the other.
     const existing = await prisma.user.findFirst({
-      where: { OR: [{ email: input.email }, { username: input.username }] },
+      where: { appId: tenant.id, OR: [{ email: input.email }, { username: input.username }] },
     });
     if (existing) throw new ApiError(409, 'An account with that email or username already exists');
 
@@ -44,6 +47,7 @@ authRouter.post('/register', authLimiter, async (req, res, next) => {
     const verifyTokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
     const user = await prisma.user.create({
       data: {
+        appId: tenant.id,
         name: input.name,
         username: input.username,
         email: input.email,
@@ -55,10 +59,10 @@ authRouter.post('/register', authLimiter, async (req, res, next) => {
       },
     });
 
-    const verifyUrl = `${env.frontendUrl}/verify-email?token=${verifyToken}`;
-    const { subject, html } = verificationEmail(verifyUrl);
-    sendMail({ to: user.email, subject, html }).catch((err) =>
-      console.error(`[auth] Failed to send verification email to ${user.email}:`, err)
+    const verifyUrl = `${frontendUrlFor(tenant)}/verify-email?token=${verifyToken}`;
+    sendMailInBackground(
+      { to: user.email, brand: mailBrandFor(tenant), ...verificationEmail(verifyUrl) },
+      `verification email to ${user.email}`
     );
 
     res.status(201).json({
@@ -84,9 +88,10 @@ const loginSchema = z.object({
  */
 authRouter.post('/login', authLimiter, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = loginSchema.parse(req.body);
 
-    const user = await prisma.user.findUnique({ where: { email: input.email } });
+    const user = await prisma.user.findUnique({ where: { appId_email: { appId: tenant.id, email: input.email } } });
     if (!user) throw new ApiError(401, 'Invalid email or password');
 
     const valid = await bcrypt.compare(input.password, user.password);
@@ -99,7 +104,7 @@ authRouter.post('/login', authLimiter, async (req, res, next) => {
 
     await prisma.user.update({ where: { id: user.id }, data: { lastLogin: new Date() } });
 
-    const token = signUserToken({ id: user.id, email: user.email, role: user.role });
+    const token = signUserToken({ id: user.id, email: user.email, role: user.role, appId: tenant.id });
 
     res.json({ message: 'Login successful', user: { ...serializeUser(user), token } });
   } catch (err) {
@@ -122,7 +127,12 @@ authRouter.post('/refresh', async (req, res, next) => {
   try {
     const input = refreshSchema.parse(req.body);
     const decoded = verifyUserToken(input.refreshToken);
-    const token = signUserToken(decoded);
+    if (decoded.appId !== tenantOf(req).id) throw new Error('Token belongs to another app');
+    // Re-read the user so a deactivated account or changed role can't be
+    // carried forward forever by refreshing.
+    const user = await prisma.user.findFirst({ where: { id: decoded.id, appId: decoded.appId, isActive: true } });
+    if (!user) throw new Error('User no longer active');
+    const token = signUserToken({ id: user.id, email: user.email, role: user.role, appId: user.appId });
     res.json({ accessToken: token });
   } catch {
     res.status(401).json({ error: 'Invalid or expired token' });
@@ -144,8 +154,9 @@ const GENERIC_FORGOT_PASSWORD_MESSAGE = 'If an account exists for that email, a 
  */
 authRouter.post('/forgot-password', authLimiter, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = forgotPasswordSchema.parse(req.body);
-    const user = await prisma.user.findUnique({ where: { email: input.email } });
+    const user = await prisma.user.findUnique({ where: { appId_email: { appId: tenant.id, email: input.email } } });
 
     // Always respond the same way whether or not the email matched a user —
     // avoids leaking which emails have accounts.
@@ -154,10 +165,10 @@ authRouter.post('/forgot-password', authLimiter, async (req, res, next) => {
       const resetTokenExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
       await prisma.user.update({ where: { id: user.id }, data: { resetToken, resetTokenExpiry } });
 
-      const resetUrl = `${env.frontendUrl}/reset-password?token=${resetToken}`;
-      const { subject, html } = passwordResetEmail(resetUrl);
-      sendMail({ to: user.email, subject, html }).catch((err) =>
-        console.error(`[auth] Failed to send password reset email to ${user.email}:`, err)
+      const resetUrl = `${frontendUrlFor(tenant)}/reset-password?token=${resetToken}`;
+      sendMailInBackground(
+        { to: user.email, brand: mailBrandFor(tenant), ...passwordResetEmail(resetUrl) },
+        `password reset email to ${user.email}`
       );
     }
 
@@ -177,7 +188,7 @@ authRouter.post('/forgot-password', authLimiter, async (req, res, next) => {
 authRouter.get('/verify-reset-token/:token', async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({ where: { resetToken: req.params.token } });
-    if (!user || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
+    if (!user || user.appId !== tenantOf(req).id || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
       throw new ApiError(400, 'This reset link is invalid or has expired');
     }
     res.json({ valid: true });
@@ -209,7 +220,7 @@ authRouter.post('/reset-password', async (req, res, next) => {
     const input = resetPasswordSchema.parse(req.body);
 
     const user = await prisma.user.findUnique({ where: { resetToken: input.token } });
-    if (!user || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
+    if (!user || user.appId !== tenantOf(req).id || !user.resetTokenExpiry || user.resetTokenExpiry < new Date()) {
       throw new ApiError(400, 'This reset link is invalid or has expired');
     }
 
@@ -241,7 +252,7 @@ authRouter.post('/verify-email', async (req, res, next) => {
     const input = verifyEmailSchema.parse(req.body);
 
     const user = await prisma.user.findUnique({ where: { verifyToken: input.token } });
-    if (!user || !user.verifyTokenExpiry || user.verifyTokenExpiry < new Date()) {
+    if (!user || user.appId !== tenantOf(req).id || !user.verifyTokenExpiry || user.verifyTokenExpiry < new Date()) {
       throw new ApiError(400, 'This verification link is invalid or has expired');
     }
 
@@ -271,8 +282,9 @@ const GENERIC_RESEND_VERIFICATION_MESSAGE = 'If an account exists for that email
  */
 authRouter.post('/resend-verification', authLimiter, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = resendVerificationSchema.parse(req.body);
-    const user = await prisma.user.findUnique({ where: { email: input.email } });
+    const user = await prisma.user.findUnique({ where: { appId_email: { appId: tenant.id, email: input.email } } });
 
     // Same anti-enumeration shape as /forgot-password — respond identically
     // whether or not the email matched an unverified account.
@@ -281,10 +293,10 @@ authRouter.post('/resend-verification', authLimiter, async (req, res, next) => {
       const verifyTokenExpiry = new Date(Date.now() + 24 * 60 * 60 * 1000);
       await prisma.user.update({ where: { id: user.id }, data: { verifyToken, verifyTokenExpiry } });
 
-      const verifyUrl = `${env.frontendUrl}/verify-email?token=${verifyToken}`;
-      const { subject, html } = verificationEmail(verifyUrl);
-      sendMail({ to: user.email, subject, html }).catch((err) =>
-        console.error(`[auth] Failed to resend verification email to ${user.email}:`, err)
+      const verifyUrl = `${frontendUrlFor(tenant)}/verify-email?token=${verifyToken}`;
+      sendMailInBackground(
+        { to: user.email, brand: mailBrandFor(tenant), ...verificationEmail(verifyUrl) },
+        `verification email to ${user.email}`
       );
     }
 
@@ -304,7 +316,7 @@ authRouter.post('/resend-verification', authLimiter, async (req, res, next) => {
  */
 authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
-    const user = await prisma.user.findUnique({ where: { id: req.user!.id } });
+    const user = await prisma.user.findFirst({ where: { id: req.user!.id, appId: tenantOf(req).id } });
     if (!user) throw new ApiError(404, 'User not found');
     res.json({ user: serializeUser(user) });
   } catch (err) {

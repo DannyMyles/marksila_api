@@ -1,11 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
 import { slugify } from '../utils/slugify';
 import { ApiError } from '../middleware/errorHandler';
-import { parseId } from '../utils/validation';
-import { uploadProductImages } from '../uploads';
+import { parseId, urlOrPathSchema } from '../utils/validation';
+import { Request } from 'express';
+import { uploadProductImages, uploadUrl } from '../uploads';
+import { tenantOf } from '../middleware/tenant';
 
 export const productsRouter = Router();
 
@@ -36,7 +39,7 @@ const imageMetaEntrySchema = z
   .object({
     type: z.enum(['upload', 'existing', 'url']),
     color: z.string().trim().max(50).nullable().optional(),
-    url: z.string().min(1).max(2048).optional(),
+    url: urlOrPathSchema.optional(),
   })
   .refine((e) => e.type === 'upload' || !!e.url, {
     message: 'url is required for existing/url image entries',
@@ -71,17 +74,27 @@ function parseJsonStringArray(raw: string | undefined, field: string): string[] 
 // Turns the imageMeta entries + any uploaded files into ProductImage create
 // rows, in order — 'upload' entries consume the next file in req.files,
 // 'existing'/'url' entries just use their given url.
-function buildImagesData(imageMeta: string, files: Express.Multer.File[]) {
+function buildImagesData(req: Request, imageMeta: string, files: Express.Multer.File[]) {
   const meta = parseImageMeta(imageMeta);
   let fileIndex = 0;
   return meta.map((entry, position) => {
     if (entry.type === 'upload') {
       const file = files[fileIndex++];
       if (!file) throw new ApiError(400, 'Not enough uploaded files for imageMeta');
-      return { url: `/uploads/products/${file.filename}`, position, color: entry.color || null };
+      return { url: uploadUrl(req, 'products', file.filename), position, color: entry.color || null };
     }
     return { url: entry.url!, position, color: entry.color || null };
   });
+}
+
+async function assertCategory(appId: number, categoryId: number) {
+  const category = await prisma.category.findFirst({ where: { id: categoryId, appId } });
+  if (!category) throw new ApiError(400, 'Category not found');
+}
+
+async function assertOwnProduct(appId: number, id: number) {
+  const product = await prisma.product.findFirst({ where: { id, appId }, select: { id: true } });
+  if (!product) throw new ApiError(404, 'Product not found');
 }
 
 function serializeProduct(product: any) {
@@ -130,7 +143,7 @@ productsRouter.get('/', async (req, res, next) => {
   try {
     const { category, search, featured } = req.query as Record<string, string | undefined>;
 
-    const where: any = {};
+    const where: Prisma.ProductWhereInput = { appId: tenantOf(req).id };
     if (category && category !== 'All') {
       where.category = { slug: category };
     }
@@ -165,14 +178,15 @@ productsRouter.get('/', async (req, res, next) => {
  */
 productsRouter.get('/:slug', async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const product = await prisma.product.findUnique({
-      where: { slug: req.params.slug },
+      where: { appId_slug: { appId, slug: req.params.slug } },
       include: includeForList,
     });
     if (!product) throw new ApiError(404, 'Product not found');
 
     const related = await prisma.product.findMany({
-      where: { categoryId: product.categoryId, id: { not: product.id } },
+      where: { appId, categoryId: product.categoryId, id: { not: product.id } },
       include: includeForList,
       take: 4,
     });
@@ -193,14 +207,17 @@ productsRouter.get('/:slug', async (req, res, next) => {
  */
 productsRouter.post('/', requireAdminKey, uploadProductImages.array('images', 20), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = productFormSchema.parse(req.body);
+    await assertCategory(appId, input.categoryId);
     const sizes = parseJsonStringArray(input.sizes, 'sizes');
     const colors = parseJsonStringArray(input.colors, 'colors');
     const files = (req.files as Express.Multer.File[] | undefined) ?? [];
-    const imagesData = buildImagesData(input.imageMeta, files);
+    const imagesData = buildImagesData(req, input.imageMeta, files);
 
     const product = await prisma.product.create({
       data: {
+        appId,
         name: input.name,
         slug: `${slugify(input.name)}-${Date.now().toString(36)}`,
         description: input.description,
@@ -231,10 +248,13 @@ productsRouter.post('/', requireAdminKey, uploadProductImages.array('images', 20
  */
 productsRouter.put('/:id', requireAdminKey, uploadProductImages.array('images', 20), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const id = parseId(req.params.id);
+    await assertOwnProduct(appId, id);
     const input = productFormSchema.partial().parse(req.body);
+    if (input.categoryId) await assertCategory(appId, input.categoryId);
 
-    const data: any = {
+    const data: Prisma.ProductUncheckedUpdateInput = {
       name: input.name,
       description: input.description,
       price: input.price,
@@ -251,9 +271,8 @@ productsRouter.put('/:id', requireAdminKey, uploadProductImages.array('images', 
 
     if (input.imageMeta) {
       const files = (req.files as Express.Multer.File[] | undefined) ?? [];
-      const imagesData = buildImagesData(input.imageMeta, files);
-      await prisma.productImage.deleteMany({ where: { productId: id } });
-      data.images = { create: imagesData };
+      const imagesData = buildImagesData(req, input.imageMeta, files);
+      data.images = { deleteMany: {}, create: imagesData };
     }
 
     const product = await prisma.product.update({
@@ -278,6 +297,7 @@ productsRouter.put('/:id', requireAdminKey, uploadProductImages.array('images', 
 productsRouter.delete('/:id', requireAdminKey, async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
+    await assertOwnProduct(tenantOf(req).id, id);
     await prisma.product.delete({ where: { id } });
     res.status(204).send();
   } catch (err) {

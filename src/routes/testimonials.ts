@@ -1,11 +1,12 @@
 import { Router } from 'express';
-import path from 'path';
 import { z } from 'zod';
 import { prisma } from '../prisma';
-import { requireAdminRole } from '../middleware/userAuth';
+import { optionalAuth, requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
-import { uploadTestimonialPhoto, testimonialsUploadDir } from '../uploads';
+import { uploadTestimonialPhoto, uploadPath, removeUpload } from '../uploads';
+import { tenantOf } from '../middleware/tenant';
 import { parseId } from '../utils/validation';
+import { assertOwned } from '../utils/tenantScope';
 import { publicWriteLimiter } from '../middleware/rateLimiters';
 
 export const testimonialsRouter = Router();
@@ -48,9 +49,15 @@ function serializeTestimonial(t: any) {
  *     summary: List all testimonials
  *     tags: [Testimonials]
  */
-testimonialsRouter.get('/', async (_req, res, next) => {
+// Public visitors only see approved testimonials; admins also see pending
+// public submissions (isActive=false) so they can review them.
+testimonialsRouter.get('/', optionalAuth, async (req, res, next) => {
   try {
-    const testimonials = await prisma.testimonial.findMany({ orderBy: { createdAt: 'desc' } });
+    const isAdmin = req.user?.role === 'admin';
+    const testimonials = await prisma.testimonial.findMany({
+      where: { appId: tenantOf(req).id, ...(isAdmin ? {} : { isActive: true }) },
+      orderBy: { createdAt: 'desc' },
+    });
     res.json({ testimonials: testimonials.map(serializeTestimonial) });
   } catch (err) {
     next(err);
@@ -59,10 +66,10 @@ testimonialsRouter.get('/', async (_req, res, next) => {
 
 testimonialsRouter.get('/:id/photo', async (req, res, next) => {
   try {
-    const testimonial = await prisma.testimonial.findUnique({ where: { id: parseId(req.params.id) } });
+    const testimonial = await prisma.testimonial.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!testimonial) throw new ApiError(404, 'Testimonial not found');
     if (!testimonial.photoFilename) throw new ApiError(404, 'No photo for this testimonial');
-    res.sendFile(path.join(testimonialsUploadDir, testimonial.photoFilename));
+    res.sendFile(uploadPath(req, 'testimonials', testimonial.photoFilename));
   } catch (err) {
     next(err);
   }
@@ -70,7 +77,7 @@ testimonialsRouter.get('/:id/photo', async (req, res, next) => {
 
 testimonialsRouter.get('/:id', async (req, res, next) => {
   try {
-    const testimonial = await prisma.testimonial.findUnique({ where: { id: parseId(req.params.id) } });
+    const testimonial = await prisma.testimonial.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!testimonial) throw new ApiError(404, 'Testimonial not found');
     res.json({ testimonial: serializeTestimonial(testimonial) });
   } catch (err) {
@@ -110,6 +117,7 @@ testimonialsRouter.post('/submit', publicWriteLimiter, uploadTestimonialPhoto.si
 
     const testimonial = await prisma.testimonial.create({
       data: {
+        appId: tenantOf(req).id,
         name: input.name,
         role: input.role,
         company: input.company,
@@ -167,6 +175,7 @@ testimonialsRouter.post('/', requireAdminRole, uploadTestimonialPhoto.single('ph
     const file = req.file;
     const testimonial = await prisma.testimonial.create({
       data: {
+        appId: tenantOf(req).id,
         name: input.name,
         role: input.role,
         company: input.company,
@@ -194,9 +203,15 @@ testimonialsRouter.put('/:id', requireAdminRole, uploadTestimonialPhoto.single('
     const input = testimonialUpdateFormSchema.parse(req.body);
     const id = parseId(req.params.id);
     const file = req.file;
+    const existing = await prisma.testimonial.findFirst({ where: { id, appId: tenantOf(req).id } });
+    if (!existing) {
+      removeUpload(req, 'testimonials', file?.filename);
+      throw new ApiError(404, 'Testimonial not found');
+    }
 
     const data: Record<string, unknown> = { ...input };
     if (file) {
+      removeUpload(req, 'testimonials', existing.photoFilename);
       data.photoFilename = file.filename;
       data.photoContentType = file.mimetype;
       data.photoSize = file.size;
@@ -214,8 +229,10 @@ const statusSchema = z.object({ isActive: z.boolean() });
 testimonialsRouter.patch('/:id/status', requireAdminRole, async (req, res, next) => {
   try {
     const input = statusSchema.parse(req.body);
+    const id = parseId(req.params.id);
+    await assertOwned(prisma.testimonial, tenantOf(req).id, id, 'Testimonial');
     const testimonial = await prisma.testimonial.update({
-      where: { id: parseId(req.params.id) },
+      where: { id },
       data: { isActive: input.isActive },
     });
     res.json({ testimonial: serializeTestimonial(testimonial) });
@@ -226,7 +243,11 @@ testimonialsRouter.patch('/:id/status', requireAdminRole, async (req, res, next)
 
 testimonialsRouter.delete('/:id', requireAdminRole, async (req, res, next) => {
   try {
-    await prisma.testimonial.delete({ where: { id: parseId(req.params.id) } });
+    const id = parseId(req.params.id);
+    const testimonial = await prisma.testimonial.findFirst({ where: { id, appId: tenantOf(req).id } });
+    if (!testimonial) throw new ApiError(404, 'Testimonial not found');
+    await prisma.testimonial.delete({ where: { id } });
+    removeUpload(req, 'testimonials', testimonial.photoFilename);
     res.status(204).send();
   } catch (err) {
     next(err);

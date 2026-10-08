@@ -1,12 +1,13 @@
 import { Router } from 'express';
-import path from 'path';
 import { z } from 'zod';
 import { prisma } from '../prisma';
 import { requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { slugify } from '../utils/slugify';
 import { parseId, urlOrPathSchema } from '../utils/validation';
-import { uploadTrainingImage, trainingsUploadDir } from '../uploads';
+import { uploadTrainingImage, uploadPath, removeUpload } from '../uploads';
+import { tenantOf } from '../middleware/tenant';
+import { uniqueSlugFor } from '../utils/tenantScope';
 
 export const trainingsRouter = Router();
 
@@ -41,9 +42,9 @@ function serializeTraining(t: any) {
  *     summary: List all training programs
  *     tags: [Trainings]
  */
-trainingsRouter.get('/', async (_req, res, next) => {
+trainingsRouter.get('/', async (req, res, next) => {
   try {
-    const trainings = await prisma.training.findMany({ orderBy: { order: 'asc' } });
+    const trainings = await prisma.training.findMany({ where: { appId: tenantOf(req).id }, orderBy: { order: 'asc' } });
     res.json({ trainings: trainings.map(serializeTraining) });
   } catch (err) {
     next(err);
@@ -52,10 +53,10 @@ trainingsRouter.get('/', async (_req, res, next) => {
 
 trainingsRouter.get('/:id/image', async (req, res, next) => {
   try {
-    const training = await prisma.training.findUnique({ where: { id: parseId(req.params.id) } });
+    const training = await prisma.training.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!training) throw new ApiError(404, 'Training not found');
     if (training.imageFilename) {
-      return res.sendFile(path.join(trainingsUploadDir, training.imageFilename));
+      return res.sendFile(uploadPath(req, 'trainings', training.imageFilename));
     }
     if (training.imageUrl) {
       return res.redirect(302, training.imageUrl);
@@ -68,7 +69,7 @@ trainingsRouter.get('/:id/image', async (req, res, next) => {
 
 trainingsRouter.get('/:id', async (req, res, next) => {
   try {
-    const training = await prisma.training.findUnique({ where: { id: parseId(req.params.id) } });
+    const training = await prisma.training.findFirst({ where: { id: parseId(req.params.id), appId: tenantOf(req).id } });
     if (!training) throw new ApiError(404, 'Training not found');
     res.json({ training: serializeTraining(training) });
   } catch (err) {
@@ -107,15 +108,8 @@ function parseFeatures(raw: string): string[] {
   return features;
 }
 
-async function uniqueSlug(title: string, excludeId?: number): Promise<string> {
-  const base = slugify(title);
-  let slug = base;
-  let n = 1;
-  while (await prisma.training.findFirst({ where: { slug, ...(excludeId ? { id: { not: excludeId } } : {}) } })) {
-    slug = `${base}-${++n}`;
-  }
-  return slug;
-}
+const uniqueSlug = (appId: number, title: string, excludeId?: number) =>
+  uniqueSlugFor(prisma.training, appId, slugify(title), excludeId);
 
 /**
  * @openapi
@@ -127,16 +121,18 @@ async function uniqueSlug(title: string, excludeId?: number): Promise<string> {
  */
 trainingsRouter.post('/', requireAdminRole, uploadTrainingImage.single('image'), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = trainingFormSchema.parse(req.body);
     const file = req.file;
     if (!file && !input.imageUrl) {
       throw new ApiError(400, 'An image (upload or URL) is required');
     }
     const features = parseFeatures(input.features);
-    const slug = await uniqueSlug(input.title);
+    const slug = await uniqueSlug(appId, input.title);
 
     const training = await prisma.training.create({
       data: {
+        appId,
         title: input.title,
         slug,
         description: input.description,
@@ -171,9 +167,15 @@ const trainingUpdateFormSchema = trainingFormSchema.partial();
  */
 trainingsRouter.put('/:id', requireAdminRole, uploadTrainingImage.single('image'), async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = trainingUpdateFormSchema.parse(req.body);
     const id = parseId(req.params.id);
     const file = req.file;
+    const existing = await prisma.training.findFirst({ where: { id, appId } });
+    if (!existing) {
+      removeUpload(req, 'trainings', file?.filename);
+      throw new ApiError(404, 'Training not found');
+    }
 
     const data: Record<string, unknown> = {
       title: input.title,
@@ -186,7 +188,8 @@ trainingsRouter.put('/:id', requireAdminRole, uploadTrainingImage.single('image'
       published: input.published,
     };
     if (input.features) data.features = JSON.stringify(parseFeatures(input.features));
-    if (input.title) data.slug = await uniqueSlug(input.title, id);
+    if (input.title) data.slug = await uniqueSlug(appId, input.title, id);
+    if (file || input.imageUrl) removeUpload(req, 'trainings', existing.imageFilename);
     if (file) {
       data.imageFilename = file.filename;
       data.imageContentType = file.mimetype;
@@ -208,7 +211,11 @@ trainingsRouter.put('/:id', requireAdminRole, uploadTrainingImage.single('image'
 
 trainingsRouter.delete('/:id', requireAdminRole, async (req, res, next) => {
   try {
-    await prisma.training.delete({ where: { id: parseId(req.params.id) } });
+    const id = parseId(req.params.id);
+    const training = await prisma.training.findFirst({ where: { id, appId: tenantOf(req).id } });
+    if (!training) throw new ApiError(404, 'Training not found');
+    await prisma.training.delete({ where: { id } });
+    removeUpload(req, 'trainings', training.imageFilename);
     res.status(204).send();
   } catch (err) {
     next(err);

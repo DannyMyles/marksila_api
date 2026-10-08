@@ -7,18 +7,21 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// Orders and bookings are confirmed over WhatsApp, not paid online — the
+// status is moved along by an admin once the customer has been in touch.
 enum OrderStatus {
   pending
-  paid
+  confirmed
   shipped
   delivered
   cancelled
 }
 
+// Recorded by an admin when money is received offline (cash, M-Pesa
+// send-money, bank) — there is no online payment integration.
 enum PaymentStatus {
-  pending
+  unpaid
   paid
-  failed
 }
 
 enum UserRole {
@@ -26,11 +29,50 @@ enum UserRole {
   admin
 }
 
+// One row per frontend that shares this backend (Fitness, SOS, ...). Every
+// tenant-owned record carries an appId, and every request is resolved to
+// exactly one App from its X-App-Key header (see src/middleware/tenant.ts),
+// so data created through one app can never be read or changed through
+// another. Add a new app with `npm run app -- upsert --key <key> ...`.
+model App {
+  id                   Int      @id @default(autoincrement())
+  key                  String   @unique @db.VarChar(40) // public identifier sent as X-App-Key
+  name                 String
+  // sha256 of the server-to-server admin key (x-admin-key); null = disabled
+  adminKeyHash         String?  @db.Char(64)
+  whatsappNumber       String?  @db.VarChar(20) // digits only, 2547XXXXXXXX
+  contactEmail         String?
+  contactPhone         String?
+  location             String?
+  notificationEmail    String? // where new order/booking alerts go
+  frontendUrl          String? // base for links in emails (verify, reset, unsubscribe)
+  youtubeChannelHandle String?  @db.VarChar(100) // gallery videos; null = none
+  orderPrefix          String   @default("ORD") @db.VarChar(10)
+  bookingPrefix        String   @default("BKG") @db.VarChar(10)
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  users              User[]
+  blogs              Blog[]
+  testimonials       Testimonial[]
+  trainings          Training[]
+  categories         Category[]
+  products           Product[]
+  orders             Order[]
+  newsletter         NewsletterSubscriber[]
+  events             Event[]
+  eventRegistrations EventRegistration[]
+  galleryCategories  GalleryCategory[]
+}
+
 model User {
   id                 Int                 @id @default(autoincrement())
+  app                App                 @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId              Int
   name               String
-  username           String              @unique
-  email              String              @unique
+  username           String
+  email              String
   password           String // bcrypt hash
   role               UserRole            @default(user)
   isActive           Boolean             @default(true)
@@ -44,12 +86,18 @@ model User {
   orders             Order[]
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
+
+  @@unique([appId, email])
+  @@unique([appId, username])
+  @@index([appId])
 }
 
 model Blog {
   id               Int      @id @default(autoincrement())
+  app              App      @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId            Int
   title            String
-  slug             String   @unique
+  slug             String
   excerpt          String   @db.Text
   content          String   @db.Text
   category         String
@@ -69,31 +117,40 @@ model Blog {
   metaDescription  String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+
+  @@unique([appId, slug])
+  @@index([appId])
 }
 
 model Testimonial {
-  id                Int      @id @default(autoincrement())
-  name              String
-  role              String
-  company           String?
-  content           String   @db.Text
-  rating            Int
-  image             String? // initials fallback, e.g. "JD" — used when no photo is uploaded
-  avatarColor       String   @default("#3b82f6")
-  photoFilename     String?
-  photoContentType  String?
-  photoSize         Int?
-  achievement       String? // short highlight badge, e.g. "-30kg Lost"
-  featured          Boolean  @default(true)
-  isActive          Boolean  @default(true)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id               Int      @id @default(autoincrement())
+  app              App      @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId            Int
+  name             String
+  role             String
+  company          String?
+  content          String   @db.Text
+  rating           Int
+  image            String? // initials fallback, e.g. "JD" — used when no photo is uploaded
+  avatarColor      String   @default("#3b82f6")
+  photoFilename    String?
+  photoContentType String?
+  photoSize        Int?
+  achievement      String? // short highlight badge, e.g. "-30kg Lost"
+  featured         Boolean  @default(true)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([appId])
 }
 
 model Training {
   id               Int      @id @default(autoincrement())
+  app              App      @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId            Int
   title            String
-  slug             String?  @unique
+  slug             String?
   description      String   @db.Text
   features         String   @db.Text // JSON-encoded string[]
   price            String
@@ -108,45 +165,57 @@ model Training {
   published        Boolean  @default(true)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+
+  @@unique([appId, slug])
+  @@index([appId])
 }
 
 model Category {
   id          Int       @id @default(autoincrement())
+  app         App       @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId       Int
   name        String
-  slug        String    @unique
+  slug        String
   description String?   @db.Text
   products    Product[]
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+
+  @@unique([appId, slug])
+  @@index([appId])
 }
 
 model Product {
-  id          Int          @id @default(autoincrement())
+  id          Int            @id @default(autoincrement())
+  app         App            @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId       Int
   name        String
-  slug        String       @unique
-  description String       @db.Text
+  slug        String
+  description String         @db.Text
   price       Int // KES, whole shillings
   images      ProductImage[]
-  sizes       String?      @db.Text // JSON-encoded string[] e.g. ["S","M","L","XL"]
-  colors      String?      @db.Text // JSON-encoded string[] e.g. ["Black","White"]
-  inStock     Boolean      @default(true)
-  featured    Boolean      @default(false)
-  isNew       Boolean      @default(false)
-  category    Category     @relation(fields: [categoryId], references: [id])
+  sizes       String?        @db.Text // JSON-encoded string[] e.g. ["S","M","L","XL"]
+  colors      String?        @db.Text // JSON-encoded string[] e.g. ["Black","White"]
+  inStock     Boolean        @default(true)
+  featured    Boolean        @default(false)
+  isNew       Boolean        @default(false)
+  category    Category       @relation(fields: [categoryId], references: [id])
   categoryId  Int
   orderItems  OrderItem[]
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
 
+  @@unique([appId, slug])
   @@index([categoryId])
+  @@index([appId])
 }
 
 model ProductImage {
-  id        Int      @id @default(autoincrement())
-  url       String   @db.VarChar(512)
-  position  Int      @default(0)
-  color     String?  // optional tag, e.g. "Black" — lets the shop page swap images when a matching color is selected
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  id        Int     @id @default(autoincrement())
+  url       String  @db.VarChar(512)
+  position  Int     @default(0)
+  color     String? // optional tag, e.g. "Black" — lets the shop page swap images when a matching color is selected
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
   productId Int
 
   @@index([productId])
@@ -154,24 +223,16 @@ model ProductImage {
 
 model Order {
   id              Int           @id @default(autoincrement())
+  app             App           @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId           Int
   orderNumber     String        @unique
   customerName    String
-  customerEmail   String
+  customerEmail   String?
   customerPhone   String
   shippingAddress String        @db.Text
+  notes           String?       @db.Text
   status          OrderStatus   @default(pending)
-  paymentMethod   String        @default("mpesa")
-  paymentStatus   PaymentStatus @default(pending)
-  paymentRef      String? // e.g. stubbed M-Pesa checkoutRequestId
-  paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
-  paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
-  // Populated from the STK callback's CallbackMetadata on a successful
-  // payment (the STK Query fallback used for local/sandbox polling can't
-  // supply these — Safaricom's query response has no CallbackMetadata — so
-  // they stay null until a real callback lands, e.g. in production).
-  mpesaPhone            String?
-  mpesaAmount           Int?
-  mpesaTransactionTime  DateTime?
+  paymentStatus   PaymentStatus @default(unpaid)
   subtotal        Int
   total           Int
   items           OrderItem[]
@@ -181,12 +242,18 @@ model Order {
   updatedAt       DateTime      @updatedAt
 
   @@index([userId])
+  @@index([appId])
 }
 
 model NewsletterSubscriber {
   id        Int      @id @default(autoincrement())
-  email     String   @unique
+  app       App      @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId     Int
+  email     String
   createdAt DateTime @default(now())
+
+  @@unique([appId, email])
+  @@index([appId])
 }
 
 model OrderItem {
@@ -196,7 +263,7 @@ model OrderItem {
   product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
   productId Int?
   name      String // snapshot at time of order
-  price     Int    // snapshot at time of order
+  price     Int // snapshot at time of order
   quantity  Int
   size      String?
   color     String?
@@ -205,15 +272,17 @@ model OrderItem {
 }
 
 enum TicketStatus {
-  pending_payment
+  pending
   confirmed
   cancelled
 }
 
 model Event {
   id               Int                 @id @default(autoincrement())
+  app              App                 @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId            Int
   title            String
-  slug             String              @unique
+  slug             String
   description      String              @db.Text
   date             DateTime
   time             String // display string, e.g. "6:00 AM - 7:00 AM"
@@ -223,23 +292,35 @@ model Event {
   imageFilename    String?
   imageContentType String?
   imageSize        Int?
-  price            Int // KES, 0 = free
+  price            Int // KES per person, 0 = free / price on request
   maxSpots         Int
+  // Optional descriptors used by listing pages (e.g. SOS adventures).
+  category         String?             @db.VarChar(60)
+  difficulty       String?             @db.VarChar(40)
+  duration         String?             @db.VarChar(60)
   popular          Boolean             @default(false)
   published        Boolean             @default(true)
-  registrations EventRegistration[]
-  createdAt     DateTime            @default(now())
-  updatedAt     DateTime            @updatedAt
+  registrations    EventRegistration[]
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@unique([appId, slug])
+  @@index([appId])
 }
 
 model GalleryCategory {
   id          Int            @id @default(autoincrement())
+  app         App            @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId       Int
   name        String
-  slug        String         @unique
+  slug        String
   description String?        @db.Text
   images      GalleryImage[]
   createdAt   DateTime       @default(now())
   updatedAt   DateTime       @updatedAt
+
+  @@unique([appId, slug])
+  @@index([appId])
 }
 
 model GalleryImage {
@@ -257,6 +338,8 @@ model GalleryImage {
 
 model EventRegistration {
   id            Int          @id @default(autoincrement())
+  app           App          @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId         Int
   ticketNumber  String       @unique
   event         Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
   eventId       Int
@@ -266,15 +349,11 @@ model EventRegistration {
   userId        Int?
   attendeeName  String
   attendeePhone String
-  status        TicketStatus @default(pending_payment)
-  paymentRef    String?
-  paymentResultCode Int?    // raw Safaricom ResultCode from the STK callback
-  paymentResultDesc String? // raw Safaricom ResultDesc from the STK callback
-  // See Order.mpesaPhone/mpesaAmount/mpesaTransactionTime — same caveat
-  // about the STK Query fallback not being able to populate these.
-  mpesaPhone            String?
-  mpesaAmount           Int?
-  mpesaTransactionTime  DateTime?
+  attendeeEmail String?
+  participants  Int          @default(1)
+  notes         String?      @db.Text
+  total         Int          @default(0) // price x participants at booking time
+  status        TicketStatus @default(pending)
   // Set the moment a door-staff scan/manual lookup successfully checks this
   // ticket in — null means "not checked in yet". Deliberately just a
   // timestamp (no separate boolean) so "checked in" and "when" are the same
@@ -284,4 +363,5 @@ model EventRegistration {
 
   @@unique([eventId, userId])
   @@index([eventId])
+  @@index([appId])
 }

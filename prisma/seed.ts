@@ -398,19 +398,51 @@ const products: ProductSeed[] = [
   },
 ];
 
-async function main() {
-  console.log(`Seeding from images at: ${IMAGES_DIR}`);
+interface AdventureSeed {
+  title: string;
+  description: string;
+  category: string;
+  difficulty: string;
+  duration: string;
+  daysFromNow: number;
+  time: string;
+  location: string;
+  maxSpots: number;
+  image: string;
+}
+
+// Source of Adventure starter catalogue (from the SOS site's original static
+// listings). Price 0 = "price on request" — set real prices from the API.
+const sosAdventures: AdventureSeed[] = [
+  { title: 'Mountain Trekking', description: 'Challenging hikes through breathtaking mountain ranges with experienced guides.', category: 'Trekking', difficulty: 'Advanced', duration: '3 Days', daysFromNow: 21, time: '6:00 AM', location: 'Mt. Kenya', maxSpots: 12, image: 'https://images.unsplash.com/photo-1551632811-561732d1e306?auto=format&fit=crop&w=1200' },
+  { title: 'Forest Exploration', description: 'Discover hidden trails and wildlife in ancient forests.', category: 'Exploration', difficulty: 'Intermediate', duration: '2 Days', daysFromNow: 14, time: '7:00 AM', location: 'Karura Forest', maxSpots: 15, image: 'https://images.unsplash.com/photo-1448375240586-882707db888b?auto=format&fit=crop&w=1200' },
+  { title: 'River Rafting', description: 'White water adventures for thrill seekers — no experience needed.', category: 'Water Sports', difficulty: 'Beginner', duration: '1 Day', daysFromNow: 10, time: '8:00 AM', location: 'Sagana', maxSpots: 16, image: 'https://images.unsplash.com/photo-1530866495561-507c9faab2ed?auto=format&fit=crop&w=1200' },
+  { title: 'Desert Safari', description: 'Experience the magic of desert landscapes under open skies.', category: 'Safari', difficulty: 'Intermediate', duration: '2 Days', daysFromNow: 35, time: '6:00 AM', location: 'Lake Magadi', maxSpots: 10, image: 'https://images.unsplash.com/photo-1509316785289-025f5b846b35?auto=format&fit=crop&w=1200' },
+  { title: 'Coastal Cycling', description: 'Scenic bike rides along stunning coastlines.', category: 'Cycling', difficulty: 'Beginner', duration: '1 Day', daysFromNow: 17, time: '7:30 AM', location: 'Diani', maxSpots: 20, image: 'https://images.unsplash.com/photo-1541625602330-2277a4c46182?auto=format&fit=crop&w=1200' },
+  { title: 'Rock Climbing', description: 'Vertical adventures on natural rock with professional guides.', category: 'Climbing', difficulty: 'Advanced', duration: '1 Day', daysFromNow: 28, time: '9:00 AM', location: "Hell's Gate", maxSpots: 8, image: 'https://images.unsplash.com/photo-1522163182402-834f871fd851?auto=format&fit=crop&w=1200' },
+];
+
+async function appId(key: string): Promise<number> {
+  const app = await prisma.app.findUnique({ where: { key } });
+  if (!app) throw new Error(`App "${key}" not found — run \`npm run prisma:deploy\` first.`);
+  return app.id;
+}
+
+async function seedFitness() {
+  const fitnessId = await appId('fitness');
+  console.log(`[fitness] Seeding from images at: ${IMAGES_DIR}`);
 
   const categoryIdByFolder = new Map<string, number>();
   for (const cat of categories) {
+    const slug = slugify(cat.name);
     const record = await prisma.category.upsert({
-      where: { slug: slugify(cat.name) },
+      where: { appId_slug: { appId: fitnessId, slug } },
       update: { description: cat.description },
-      create: { name: cat.name, slug: slugify(cat.name), description: cat.description },
+      create: { appId: fitnessId, name: cat.name, slug, description: cat.description },
     });
     categoryIdByFolder.set(cat.folder, record.id);
   }
-  console.log(`Upserted ${categories.length} categories.`);
+  console.log(`[fitness] Upserted ${categories.length} categories.`);
 
   let created = 0;
   for (const p of products) {
@@ -418,14 +450,12 @@ async function main() {
     if (!categoryId) throw new Error(`Unknown category folder: ${p.categoryFolder}`);
 
     const slug = slugify(p.name);
-    const existing = await prisma.product.findUnique({ where: { slug } });
-    if (existing) {
-      console.log(`Skipping existing product: ${p.name}`);
-      continue;
-    }
+    const existing = await prisma.product.findUnique({ where: { appId_slug: { appId: fitnessId, slug } } });
+    if (existing) continue;
 
     await prisma.product.create({
       data: {
+        appId: fitnessId,
         name: p.name,
         slug,
         description: p.description,
@@ -446,39 +476,37 @@ async function main() {
     });
     created += 1;
   }
+  console.log(`[fitness] Created ${created} products (${products.length - created} already existed).`);
 
-  console.log(`Created ${created} products (${products.length - created} already existed).`);
-
-  const existingAdmin = await prisma.user.findUnique({ where: { email: ADMIN_EMAIL } });
+  const existingAdmin = await prisma.user.findUnique({ where: { appId_email: { appId: fitnessId, email: ADMIN_EMAIL } } });
   if (!existingAdmin) {
-    const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
     await prisma.user.create({
       data: {
+        appId: fitnessId,
         name: 'Admin',
         username: 'admin',
         email: ADMIN_EMAIL,
-        password: passwordHash,
+        password: await bcrypt.hash(ADMIN_PASSWORD, 10),
         role: 'admin',
       },
     });
-    console.log(`Created admin user: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}`);
-  } else {
-    console.log('Admin user already exists, skipping.');
+    console.log(`[fitness] Created admin user: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} — change this password.`);
   }
 
   let trainingsCreated = 0;
   for (const [index, t] of trainings.entries()) {
     const slug = slugify(t.title);
-    const existingTraining = await prisma.training.findUnique({ where: { slug } });
+    const existingTraining = await prisma.training.findUnique({ where: { appId_slug: { appId: fitnessId, slug } } });
     if (existingTraining) continue;
     await prisma.training.create({
       data: {
+        appId: fitnessId,
         title: t.title,
         slug,
         description: t.description,
         features: JSON.stringify(t.features),
         price: t.price,
-        image: t.image,
+        imageUrl: t.image,
         icon: t.icon,
         color: t.color,
         popular: t.popular ?? false,
@@ -487,14 +515,15 @@ async function main() {
     });
     trainingsCreated += 1;
   }
-  console.log(`Created ${trainingsCreated} trainings (${trainings.length - trainingsCreated} already existed).`);
+  console.log(`[fitness] Created ${trainingsCreated} trainings.`);
 
   let testimonialsCreated = 0;
   for (const t of testimonials) {
-    const existingTestimonial = await prisma.testimonial.findFirst({ where: { name: t.name } });
+    const existingTestimonial = await prisma.testimonial.findFirst({ where: { appId: fitnessId, name: t.name } });
     if (existingTestimonial) continue;
     await prisma.testimonial.create({
       data: {
+        appId: fitnessId,
         name: t.name,
         role: t.role,
         content: t.content,
@@ -506,7 +535,46 @@ async function main() {
     });
     testimonialsCreated += 1;
   }
-  console.log(`Created ${testimonialsCreated} testimonials (${testimonials.length - testimonialsCreated} already existed).`);
+  console.log(`[fitness] Created ${testimonialsCreated} testimonials.`);
+}
+
+async function seedSos() {
+  const sosId = await appId('sos');
+  let created = 0;
+  for (const a of sosAdventures) {
+    const slug = slugify(a.title);
+    const existing = await prisma.event.findUnique({ where: { appId_slug: { appId: sosId, slug } } });
+    if (existing) continue;
+    const date = new Date();
+    date.setUTCHours(0, 0, 0, 0);
+    date.setUTCDate(date.getUTCDate() + a.daysFromNow);
+    await prisma.event.create({
+      data: {
+        appId: sosId,
+        title: a.title,
+        slug,
+        description: a.description,
+        date,
+        time: a.time,
+        location: a.location,
+        trainers: '[]',
+        category: a.category,
+        difficulty: a.difficulty,
+        duration: a.duration,
+        imageUrl: a.image,
+        price: 0,
+        maxSpots: a.maxSpots,
+      },
+    });
+    created += 1;
+  }
+  console.log(`[sos] Created ${created} adventures (${sosAdventures.length - created} already existed).`);
+}
+
+async function main() {
+  const only = process.argv[2]; // optional: "fitness" | "sos"
+  if (!only || only === 'fitness') await seedFitness();
+  if (!only || only === 'sos') await seedSos();
 }
 
 main()

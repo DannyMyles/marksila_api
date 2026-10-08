@@ -5,8 +5,14 @@ import { requireAdminKey } from '../middleware/adminAuth';
 import { slugify } from '../utils/slugify';
 import { ApiError } from '../middleware/errorHandler';
 import { parseId } from '../utils/validation';
+import { tenantOf } from '../middleware/tenant';
 
 export const categoriesRouter = Router();
+
+async function assertOwnCategory(appId: number, id: number) {
+  const category = await prisma.category.findFirst({ where: { id, appId }, select: { id: true } });
+  if (!category) throw new ApiError(404, 'Category not found');
+}
 
 const categoryInputSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -23,9 +29,10 @@ const categoryInputSchema = z.object({
  *       200:
  *         description: List of categories with product counts
  */
-categoriesRouter.get('/', async (_req, res, next) => {
+categoriesRouter.get('/', async (req, res, next) => {
   try {
     const categories = await prisma.category.findMany({
+      where: { appId: tenantOf(req).id },
       orderBy: { name: 'asc' },
       include: { _count: { select: { products: true } } },
     });
@@ -55,7 +62,7 @@ categoriesRouter.post('/', requireAdminKey, async (req, res, next) => {
   try {
     const input = categoryInputSchema.parse(req.body);
     const category = await prisma.category.create({
-      data: { name: input.name, description: input.description, slug: slugify(input.name) },
+      data: { appId: tenantOf(req).id, name: input.name, description: input.description, slug: slugify(input.name) },
     });
     res.status(201).json(category);
   } catch (err) {
@@ -74,6 +81,7 @@ categoriesRouter.post('/', requireAdminKey, async (req, res, next) => {
 categoriesRouter.put('/:id', requireAdminKey, async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
+    await assertOwnCategory(tenantOf(req).id, id);
     const input = categoryInputSchema.partial().parse(req.body);
     const data: { name?: string; description?: string; slug?: string } = { ...input };
     if (input.name) data.slug = slugify(input.name);
@@ -95,6 +103,7 @@ categoriesRouter.put('/:id', requireAdminKey, async (req, res, next) => {
 categoriesRouter.delete('/:id', requireAdminKey, async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
+    await assertOwnCategory(tenantOf(req).id, id);
     const productCount = await prisma.product.count({ where: { categoryId: id } });
     if (productCount > 0) {
       throw new ApiError(409, `Cannot delete category with ${productCount} product(s). Reassign or delete them first.`);

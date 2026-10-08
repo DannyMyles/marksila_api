@@ -1,12 +1,12 @@
 import { Router } from 'express';
-import fs from 'fs';
-import path from 'path';
 import { z } from 'zod';
 import { prisma } from '../prisma';
 import { requireAdminRole } from '../middleware/userAuth';
 import { ApiError } from '../middleware/errorHandler';
 import { slugify } from '../utils/slugify';
-import { uploadGalleryImages, galleryUploadDir } from '../uploads';
+import { uploadGalleryImages, uploadPath, removeUpload } from '../uploads';
+import { tenantOf } from '../middleware/tenant';
+import { assertOwned, uniqueSlugFor } from '../utils/tenantScope';
 import { parseId } from '../utils/validation';
 
 export const galleryRouter = Router();
@@ -33,18 +33,18 @@ function serializeImage(img: any) {
   };
 }
 
-async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
-  const base = slugify(name);
-  let slug = base;
-  let n = 1;
-  while (
-    await prisma.galleryCategory.findFirst({
-      where: { slug, ...(excludeId ? { id: { not: excludeId } } : {}) },
-    })
-  ) {
-    slug = `${base}-${++n}`;
-  }
-  return slug;
+const uniqueSlug = (appId: number, name: string, excludeId?: number) =>
+  uniqueSlugFor(prisma.galleryCategory, appId, slugify(name), excludeId);
+
+/** Gallery images have no appId of their own — they belong to an app through their category. */
+async function findOwnImage(appId: number, id: number) {
+  const image = await prisma.galleryImage.findFirst({ where: { id, category: { appId } } });
+  if (!image) throw new ApiError(404, 'Image not found');
+  return image;
+}
+
+async function assertOwnCategory(appId: number, id: number) {
+  await assertOwned(prisma.galleryCategory, appId, id, 'Category');
 }
 
 /**
@@ -54,9 +54,10 @@ async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
  *     summary: List gallery categories
  *     tags: [Gallery]
  */
-galleryRouter.get('/categories', async (_req, res, next) => {
+galleryRouter.get('/categories', async (req, res, next) => {
   try {
     const categories = await prisma.galleryCategory.findMany({
+      where: { appId: tenantOf(req).id },
       orderBy: { name: 'asc' },
       include: { _count: { select: { images: true } } },
     });
@@ -73,10 +74,11 @@ const categorySchema = z.object({
 
 galleryRouter.post('/categories', requireAdminRole, async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const input = categorySchema.parse(req.body);
-    const slug = await uniqueSlug(input.name);
+    const slug = await uniqueSlug(appId, input.name);
     const category = await prisma.galleryCategory.create({
-      data: { name: input.name, description: input.description, slug },
+      data: { appId, name: input.name, description: input.description, slug },
       include: { _count: { select: { images: true } } },
     });
     res.status(201).json({ category: serializeCategory(category) });
@@ -87,11 +89,13 @@ galleryRouter.post('/categories', requireAdminRole, async (req, res, next) => {
 
 galleryRouter.put('/categories/:id', requireAdminRole, async (req, res, next) => {
   try {
+    const appId = tenantOf(req).id;
     const id = parseId(req.params.id);
+    await assertOwnCategory(appId, id);
     const input = categorySchema.partial().parse(req.body);
 
     const data: Record<string, unknown> = { ...input };
-    if (input.name) data.slug = await uniqueSlug(input.name, id);
+    if (input.name) data.slug = await uniqueSlug(appId, input.name, id);
 
     const category = await prisma.galleryCategory.update({
       where: { id },
@@ -107,6 +111,7 @@ galleryRouter.put('/categories/:id', requireAdminRole, async (req, res, next) =>
 galleryRouter.delete('/categories/:id', requireAdminRole, async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
+    await assertOwnCategory(tenantOf(req).id, id);
     const imageCount = await prisma.galleryImage.count({ where: { categoryId: id } });
     if (imageCount > 0) {
       throw new ApiError(409, `Cannot delete category with ${imageCount} photo(s). Delete them first.`);
@@ -128,7 +133,10 @@ galleryRouter.delete('/categories/:id', requireAdminRole, async (req, res, next)
 galleryRouter.get('/images', async (req, res, next) => {
   try {
     const { categoryId } = req.query as Record<string, string | undefined>;
-    const where = categoryId ? { categoryId: parseId(categoryId) } : {};
+    const where = {
+      category: { appId: tenantOf(req).id },
+      ...(categoryId ? { categoryId: parseId(categoryId) } : {}),
+    };
     const images = await prisma.galleryImage.findMany({ where, orderBy: { createdAt: 'desc' } });
     res.json({ images: images.map(serializeImage) });
   } catch (err) {
@@ -138,9 +146,8 @@ galleryRouter.get('/images', async (req, res, next) => {
 
 galleryRouter.get('/images/:id/file', async (req, res, next) => {
   try {
-    const image = await prisma.galleryImage.findUnique({ where: { id: parseId(req.params.id) } });
-    if (!image) throw new ApiError(404, 'Image not found');
-    res.sendFile(path.join(galleryUploadDir, image.filename));
+    const image = await findOwnImage(tenantOf(req).id, parseId(req.params.id));
+    res.sendFile(uploadPath(req, 'gallery', image.filename));
   } catch (err) {
     next(err);
   }
@@ -161,8 +168,11 @@ galleryRouter.post(
       const file = req.file;
       if (!file) throw new ApiError(400, 'An image file is required');
 
-      const category = await prisma.galleryCategory.findUnique({ where: { id: input.categoryId } });
-      if (!category) throw new ApiError(404, 'Category not found');
+      const category = await prisma.galleryCategory.findFirst({ where: { id: input.categoryId, appId: tenantOf(req).id } });
+      if (!category) {
+        removeUpload(req, 'gallery', file.filename);
+        throw new ApiError(404, 'Category not found');
+      }
 
       const image = await prisma.galleryImage.create({
         data: {
@@ -194,8 +204,11 @@ galleryRouter.post(
       const files = (req.files as Express.Multer.File[] | undefined) ?? [];
       if (files.length === 0) throw new ApiError(400, 'At least one image file is required');
 
-      const category = await prisma.galleryCategory.findUnique({ where: { id: input.categoryId } });
-      if (!category) throw new ApiError(404, 'Category not found');
+      const category = await prisma.galleryCategory.findFirst({ where: { id: input.categoryId, appId: tenantOf(req).id } });
+      if (!category) {
+        files.forEach((f) => removeUpload(req, 'gallery', f.filename));
+        throw new ApiError(404, 'Category not found');
+      }
 
       const images = await prisma.$transaction(
         files.map((file) =>
@@ -219,16 +232,9 @@ galleryRouter.post(
 galleryRouter.delete('/images/:id', requireAdminRole, async (req, res, next) => {
   try {
     const id = parseId(req.params.id);
-    const image = await prisma.galleryImage.findUnique({ where: { id } });
-    if (!image) throw new ApiError(404, 'Image not found');
-
+    const image = await findOwnImage(tenantOf(req).id, id);
     await prisma.galleryImage.delete({ where: { id } });
-
-    fs.unlink(path.join(galleryUploadDir, image.filename), (err) => {
-      if (err && err.code !== 'ENOENT') {
-        console.error(`[gallery] Failed to delete file for image ${id}:`, err);
-      }
-    });
+    removeUpload(req, 'gallery', image.filename);
 
     res.status(204).send();
   } catch (err) {

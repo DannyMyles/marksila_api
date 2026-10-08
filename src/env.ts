@@ -11,8 +11,13 @@ function required(name: string): string {
 export const env = {
   port: Number(process.env.PORT ?? 4000),
   databaseUrl: required('DATABASE_URL'),
-  adminApiKey: required('ADMIN_API_KEY'),
-  corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
+  // Comma-separated browser origins allowed to call the API directly. The
+  // frontends normally go through their own same-origin /api proxy, so this
+  // only matters for tools like Swagger UI or a frontend without a proxy.
+  corsOrigins: (process.env.CORS_ORIGINS ?? process.env.CORS_ORIGIN ?? 'http://localhost:3000,http://localhost:3001')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   jwtSecret: required('JWT_SECRET'),
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '24h',
   // SMTP is intentionally optional at startup — sendMail() fails at send-time
@@ -21,20 +26,10 @@ export const env = {
   smtpPort: Number(process.env.SMTP_PORT ?? 587),
   smtpUser: process.env.SMTP_USER ?? '',
   smtpPass: process.env.SMTP_PASS ?? '',
+  // Fallbacks for apps that don't set their own notificationEmail/frontendUrl.
   adminNotificationEmail: process.env.ADMIN_NOTIFICATION_EMAIL || process.env.SMTP_USER || '',
   frontendUrl: process.env.FRONTEND_URL ?? 'http://localhost:3000',
-  // M-Pesa (Daraja) is intentionally optional at startup — when unset, the
-  // payment provider factory (src/payments/index.ts) falls back to the
-  // simulated StubMpesaProvider instead of failing to boot.
-  mpesaEnv: process.env.MPESA_ENV ?? 'sandbox',
-  mpesaConsumerKey: process.env.MPESA_CONSUMER_KEY ?? '',
-  mpesaConsumerSecret: process.env.MPESA_CONSUMER_SECRET ?? '',
-  mpesaShortcode: process.env.MPESA_SHORTCODE ?? '',
-  mpesaPasskey: process.env.MPESA_PASSKEY ?? '',
-  mpesaCallbackUrl: process.env.MPESA_CALLBACK_URL ?? '',
-  // YouTube video sync is intentionally optional at startup, same pattern as
-  // M-Pesa above — src/services/youtube.ts checks this and the route
-  // returns an empty list rather than failing if unset.
+  // YouTube video sync is optional — without a key the route returns an
+  // empty list. The channel itself is per app (App.youtubeChannelHandle).
   youtubeApiKey: process.env.YOUTUBE_API_KEY ?? '',
-  youtubeChannelHandle: process.env.YOUTUBE_CHANNEL_HANDLE ?? 'marksila254',
 };
