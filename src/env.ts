@@ -26,6 +26,10 @@ export const env = {
   smtpPort: Number(process.env.SMTP_PORT ?? 587),
   smtpUser: process.env.SMTP_USER ?? '',
   smtpPass: process.env.SMTP_PASS ?? '',
+  // Sender address; defaults to SMTP_USER (most providers require a match).
+  mailFrom: process.env.MAIL_FROM ?? '',
+  // Dev only: with no SMTP, rendered emails are written here as .html/.txt.
+  mailPreviewDir: process.env.MAIL_PREVIEW_DIR ?? '',
   // Fallbacks for apps that don't set their own notificationEmail/frontendUrl.
   adminNotificationEmail: process.env.ADMIN_NOTIFICATION_EMAIL || process.env.SMTP_USER || '',
   frontendUrl: process.env.FRONTEND_URL ?? 'http://localhost:3000',

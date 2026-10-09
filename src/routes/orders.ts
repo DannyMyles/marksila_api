@@ -4,9 +4,9 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { requireAdminKey } from '../middleware/adminAuth';
 import { optionalAuth, requireAuth } from '../middleware/userAuth';
-import { mailBrandFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
+import { adminUrlFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
 import { ApiError } from '../middleware/errorHandler';
-import { sendMailInBackground, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
+import { deliverEmailInBackground, orderConfirmationEmail, orderAlertEmail, orderStatusUpdateEmail } from '../mailer';
 import { parseId, phoneSchema } from '../utils/validation';
 import { generateReference } from '../utils/reference';
 import { orderWhatsApp } from '../services/whatsapp';
@@ -137,40 +137,26 @@ ordersRouter.post('/', publicWriteLimiter, optionalAuth, async (req, res, next) 
       }
     }
 
-    const brand = mailBrandFor(tenant);
-    if (order.customerEmail) {
-      sendMailInBackground(
-        {
-          to: order.customerEmail,
-          brand,
-          ...orderConfirmationEmail({
-            orderNumber: order.orderNumber,
-            customerName: order.customerName,
-            items: order.items.map((i) => ({ name: i.name, price: i.price, quantity: i.quantity })),
-            subtotal: order.subtotal,
-            total: order.total,
-            shippingAddress: order.shippingAddress,
-          }),
-        },
-        `order confirmation ${order.orderNumber}`
-      );
-    }
-    sendMailInBackground(
-      {
-        to: notificationEmailFor(tenant),
-        brand,
-        ...orderAlertEmail({
-          orderNumber: order.orderNumber,
-          customerName: order.customerName,
-          customerPhone: order.customerPhone,
-          customerEmail: order.customerEmail,
-          total: order.total,
-        }),
-      },
-      `order alert ${order.orderNumber}`
-    );
+    const whatsapp = orderWhatsApp(tenant, order);
+    deliverEmailInBackground({
+      tenant,
+      kind: 'order_received',
+      to: order.customerEmail,
+      template: orderConfirmationEmail(order, { whatsappUrl: whatsapp?.url }),
+      dedupeKey: `order-received:${order.id}`,
+      entity: { type: 'order', id: order.id },
+    });
+    deliverEmailInBackground({
+      tenant,
+      kind: 'order_alert',
+      to: notificationEmailFor(tenant),
+      template: orderAlertEmail(order, adminUrlFor(tenant, `/orders/${order.id}`)),
+      dedupeKey: `order-alert:${order.id}`,
+      entity: { type: 'order', id: order.id },
+      replyTo: order.customerEmail ?? undefined,
+    });
 
-    res.status(201).json({ order: serializeOrder(order), whatsapp: orderWhatsApp(tenant, order) });
+    res.status(201).json({ order: serializeOrder(order), whatsapp });
   } catch (err) {
     next(err);
   }
@@ -314,20 +300,15 @@ ordersRouter.patch('/:id/status', requireAdminKey, async (req, res, next) => {
 
     const order = await prisma.order.update({ where: { id }, data: input, include: { items: true } });
 
-    if (input.status && input.status !== existing.status && order.customerEmail) {
-      sendMailInBackground(
-        {
-          to: order.customerEmail,
-          brand: mailBrandFor(tenant),
-          ...orderStatusUpdateEmail({
-            orderNumber: order.orderNumber,
-            customerName: order.customerName,
-            status: order.status,
-            total: order.total,
-          }),
-        },
-        `order status update ${order.orderNumber}`
-      );
+    if (input.status && input.status !== existing.status) {
+      deliverEmailInBackground({
+        tenant,
+        kind: 'order_status',
+        to: order.customerEmail,
+        template: orderStatusUpdateEmail(order),
+        dedupeKey: `order-status:${order.id}:${order.status}`,
+        entity: { type: 'order', id: order.id },
+      });
     }
 
     res.json(serializeOrder(order));

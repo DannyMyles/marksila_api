@@ -11,7 +11,7 @@ import { tenantOf } from './middleware/tenant';
  */
 export const uploadsRoot = path.join(process.cwd(), 'uploads');
 
-export type UploadKind = 'blogs' | 'testimonials' | 'events' | 'gallery' | 'products' | 'trainings';
+export type UploadKind = 'blogs' | 'testimonials' | 'events' | 'gallery' | 'products' | 'trainings' | 'banners' | 'branding';
 
 const ALLOWED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
 
@@ -61,6 +61,8 @@ export const uploadEventImage = createImageUploader('events');
 export const uploadGalleryImages = createImageUploader('gallery');
 export const uploadProductImages = createImageUploader('products');
 export const uploadTrainingImage = createImageUploader('trainings');
+export const uploadBannerImage = createImageUploader('banners');
+export const uploadBrandingImage = createImageUploader('branding');
 
 /** Best-effort removal of a replaced/deleted upload (missing file is fine). */
 export function removeUpload(req: Request, kind: UploadKind, filename: string | null | undefined) {

@@ -5,15 +5,24 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../prisma';
 import { optionalAuth, requireAuth } from '../middleware/userAuth';
 import { requireAdminKey } from '../middleware/adminAuth';
-import { mailBrandFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
+import { Tenant, adminUrlFor, frontendUrlFor, notificationEmailFor, tenantOf } from '../middleware/tenant';
 import { ApiError } from '../middleware/errorHandler';
 import { slugify } from '../utils/slugify';
-import { sendMailInBackground, eventTicketEmail, eventRegistrationAlertEmail } from '../mailer';
+import {
+  deliverEmail,
+  deliverEmailInBackground,
+  deliveryMessage,
+  bookingReceivedEmail,
+  bookingAlertEmail,
+  bookingStatusEmail,
+  bookingReminderEmail,
+  BookingForEmail,
+} from '../mailer';
 import { uploadEventImage, uploadPath, removeUpload } from '../uploads';
 import { parseId, urlOrPathSchema, phoneSchema } from '../utils/validation';
 import { generateReference } from '../utils/reference';
 import { assertOwned, uniqueSlugFor } from '../utils/tenantScope';
-import { bookingWhatsApp } from '../services/whatsapp';
+import { bookingWhatsApp, chatWhatsApp } from '../services/whatsapp';
 import { publicWriteLimiter } from '../middleware/rateLimiters';
 
 /**
@@ -26,6 +35,7 @@ import { publicWriteLimiter } from '../middleware/rateLimiters';
 export const eventsRouter = Router();
 
 const MAX_PARTICIPANTS = 20;
+const EVENT_KINDS = ['event', 'adventure'] as const;
 
 function imageInfoFor(event: { id: number; imageFilename: string | null; imageUrl: string | null; imageContentType?: string | null; imageSize?: number | null }) {
   const hasImage = Boolean(event.imageFilename || event.imageUrl);
@@ -50,6 +60,7 @@ function serializeEvent(event: EventRow, spotsTaken: number) {
     date: event.date,
     time: event.time,
     location: event.location,
+    kind: event.kind,
     trainers: event.trainers ? JSON.parse(event.trainers) : [],
     category: event.category,
     difficulty: event.difficulty,
@@ -81,7 +92,56 @@ function serializeRegistration(reg: RegistrationRow) {
     status: reg.status,
     checkedInAt: reg.checkedInAt,
     createdAt: reg.createdAt,
+    updatedAt: reg.updatedAt,
   };
+}
+
+const BOOKING_STATUSES = ['pending', 'confirmed', 'completed', 'cancelled'] as const;
+
+type EventForEmail = { title: string; date: Date; time: string; location: string; price: number };
+
+function bookingForEmail(reg: RegistrationRow, event: EventForEmail): BookingForEmail {
+  return { ...reg, event };
+}
+
+/** Customer email for a booking's current status (confirmed / cancelled / ...). */
+function sendBookingStatusEmail(tenant: Tenant, reg: RegistrationRow, event: EventForEmail, dedupe: boolean) {
+  return deliverEmail({
+    tenant,
+    kind: 'booking_status',
+    to: reg.attendeeEmail,
+    template: bookingStatusEmail(bookingForEmail(reg, event), {
+      whatsappUrl: chatWhatsApp(tenant, `Hello ${tenant.name}, about my booking ${reg.ticketNumber}.`)?.url,
+      siteUrl: frontendUrlFor(tenant),
+    }),
+    dedupeKey: dedupe ? `booking-status:${reg.id}:${reg.status}` : undefined,
+    entity: { type: 'booking', id: reg.id },
+  });
+}
+
+function sendBookingReceivedEmails(tenant: Tenant, reg: RegistrationRow, event: EventForEmail, whatsappUrl?: string) {
+  const booking = bookingForEmail(reg, event);
+  deliverEmailInBackground({
+    tenant,
+    kind: 'booking_received',
+    to: reg.attendeeEmail,
+    template: bookingReceivedEmail(booking, { whatsappUrl, withQr: true }),
+    dedupeKey: `booking-received:${reg.id}`,
+    entity: { type: 'booking', id: reg.id },
+    // QR of the reference, for door check-in.
+    attachments: async () => [
+      { filename: 'ticket-qr.png', content: await QRCode.toBuffer(reg.ticketNumber, { width: 400, margin: 1 }), cid: 'qr-ticket' },
+    ],
+  });
+  deliverEmailInBackground({
+    tenant,
+    kind: 'booking_alert',
+    to: notificationEmailFor(tenant),
+    template: bookingAlertEmail(booking, adminUrlFor(tenant, `/bookings?q=${encodeURIComponent(reg.ticketNumber)}`)),
+    dedupeKey: `booking-alert:${reg.id}`,
+    entity: { type: 'booking', id: reg.id },
+    replyTo: reg.attendeeEmail ?? undefined,
+  });
 }
 
 /** Spots taken per event = sum of participants over non-cancelled bookings. */
@@ -109,8 +169,9 @@ async function serializeEvents(events: EventRow[]) {
  */
 eventsRouter.get('/', optionalAuth, async (req, res, next) => {
   try {
-    const { upcoming, all } = req.query as Record<string, string | undefined>;
+    const { upcoming, all, kind } = req.query as Record<string, string | undefined>;
     const where: Prisma.EventWhereInput = { appId: tenantOf(req).id };
+    if (kind && EVENT_KINDS.includes(kind as (typeof EVENT_KINDS)[number])) where.kind = kind;
     if (!(all === 'true' && req.user?.role === 'admin')) where.published = true;
     if (upcoming === 'true') {
       // `date` stores a calendar date (midnight UTC) — compare against the
@@ -170,17 +231,56 @@ eventsRouter.get('/registrations/mine', requireAuth, async (req, res, next) => {
  *     tags: [Events]
  *     security: [{ AdminKey: [] }, { BearerAuth: [] }]
  */
+const registrationListSchema = z.object({
+  status: z.enum(BOOKING_STATUSES).optional(),
+  eventId: z.coerce.number().int().positive().optional(),
+  q: z.string().trim().max(100).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(200).default(50),
+  sort: z.enum(['newest', 'oldest', 'eventDate']).default('newest'),
+});
+
 eventsRouter.get('/registrations/all', requireAdminKey, async (req, res, next) => {
   try {
-    const status = z.enum(['pending', 'confirmed', 'cancelled']).optional().parse(req.query.status || undefined);
-    const registrations = await prisma.eventRegistration.findMany({
-      where: { appId: tenantOf(req).id, ...(status ? { status } : {}) },
-      include: { event: { select: { id: true, title: true, slug: true, date: true, time: true, location: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: 500,
-    });
+    const appId = tenantOf(req).id;
+    const query = registrationListSchema.parse(
+      Object.fromEntries(Object.entries(req.query).filter(([, v]) => v !== '' && v !== undefined))
+    );
+    const where: Prisma.EventRegistrationWhereInput = {
+      appId,
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.eventId ? { eventId: query.eventId } : {}),
+      ...(query.q
+        ? {
+            OR: [
+              { ticketNumber: { contains: query.q } },
+              { attendeeName: { contains: query.q } },
+              { attendeePhone: { contains: query.q } },
+              { attendeeEmail: { contains: query.q } },
+              { event: { title: { contains: query.q } } },
+            ],
+          }
+        : {}),
+    };
+    const orderBy: Prisma.EventRegistrationOrderByWithRelationInput =
+      query.sort === 'oldest' ? { createdAt: 'asc' } : query.sort === 'eventDate' ? { event: { date: 'asc' } } : { createdAt: 'desc' };
+    const [total, registrations, counts] = await Promise.all([
+      prisma.eventRegistration.count({ where }),
+      prisma.eventRegistration.findMany({
+        where,
+        include: { event: { select: { id: true, title: true, slug: true, date: true, time: true, location: true, price: true } } },
+        orderBy,
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
+      }),
+      prisma.eventRegistration.groupBy({ by: ['status'], where: { appId }, _count: { _all: true } }),
+    ]);
     res.json({
       registrations: registrations.map((r) => ({ ...serializeRegistration(r), event: r.event })),
+      total,
+      page: query.page,
+      pageSize: query.pageSize,
+      statusCounts: Object.fromEntries(counts.map((c) => [c.status, c._count._all])),
     });
   } catch (err) {
     next(err);
@@ -188,24 +288,92 @@ eventsRouter.get('/registrations/all', requireAdminKey, async (req, res, next) =
 });
 
 const registrationStatusSchema = z.object({
-  status: z.enum(['pending', 'confirmed', 'cancelled']),
+  status: z.enum(BOOKING_STATUSES),
+  notify: z.boolean().default(true),
 });
 
 /**
  * @openapi
  * /api/v1/events/registrations/{id}/status:
  *   patch:
- *     summary: Confirm or cancel a booking (admin)
+ *     summary: Move a booking to pending / confirmed / completed / cancelled (admin). Emails the customer unless notify=false.
  *     tags: [Events]
  *     security: [{ AdminKey: [] }, { BearerAuth: [] }]
  */
 eventsRouter.patch('/registrations/:id/status', requireAdminKey, async (req, res, next) => {
   try {
+    const tenant = tenantOf(req);
     const input = registrationStatusSchema.parse(req.body);
     const id = parseId(req.params.id);
-    await assertOwned(prisma.eventRegistration, tenantOf(req).id, id, 'Booking');
+    const existing = await prisma.eventRegistration.findFirst({ where: { id, appId: tenant.id }, include: { event: true } });
+    if (!existing) throw new ApiError(404, 'Booking not found');
+
+    if (input.status !== 'cancelled' && existing.status === 'cancelled') {
+      // Re-activating a cancelled booking takes spots again — make sure they exist.
+      const taken = await prisma.eventRegistration.aggregate({
+        where: { eventId: existing.eventId, status: { not: 'cancelled' } },
+        _sum: { participants: true },
+      });
+      const remaining = existing.event.maxSpots - (taken._sum.participants ?? 0);
+      if (existing.participants > remaining) {
+        throw new ApiError(409, `Not enough spots left to restore this booking (${Math.max(0, remaining)} left).`);
+      }
+    }
+
     const registration = await prisma.eventRegistration.update({ where: { id }, data: { status: input.status } });
-    res.json({ registration: serializeRegistration(registration) });
+    let email: { status: string; message: string } | undefined;
+    if (input.notify && input.status !== existing.status) {
+      const result = await sendBookingStatusEmail(tenant, registration, existing.event, true);
+      email = { status: result.status, message: deliveryMessage(result.status, 'Customer email') };
+    }
+    res.json({ registration: serializeRegistration(registration), email });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const notifySchema = z.object({ type: z.enum(['received', 'status', 'reminder']) });
+
+/**
+ * @openapi
+ * /api/v1/events/registrations/{id}/notify:
+ *   post:
+ *     summary: (Re)send the booking-received, current-status or reminder email to the customer (admin)
+ *     tags: [Events]
+ *     security: [{ AdminKey: [] }, { BearerAuth: [] }]
+ */
+eventsRouter.post('/registrations/:id/notify', requireAdminKey, async (req, res, next) => {
+  try {
+    const tenant = tenantOf(req);
+    const { type } = notifySchema.parse(req.body);
+    const id = parseId(req.params.id);
+    const reg = await prisma.eventRegistration.findFirst({ where: { id, appId: tenant.id }, include: { event: true } });
+    if (!reg) throw new ApiError(404, 'Booking not found');
+    if (!reg.attendeeEmail) throw new ApiError(400, 'This booking has no email address.');
+    if (type === 'reminder' && reg.status === 'cancelled') throw new ApiError(409, 'This booking is cancelled.');
+
+    const whatsappUrl = chatWhatsApp(tenant, `Hello ${tenant.name}, about my booking ${reg.ticketNumber}.`)?.url;
+    const result =
+      type === 'status'
+        ? await sendBookingStatusEmail(tenant, reg, reg.event, false)
+        : await deliverEmail({
+            tenant,
+            kind: type === 'reminder' ? 'booking_reminder' : 'booking_received',
+            to: reg.attendeeEmail,
+            template:
+              type === 'reminder'
+                ? bookingReminderEmail(bookingForEmail(reg, reg.event), { whatsappUrl })
+                : bookingReceivedEmail(bookingForEmail(reg, reg.event), { whatsappUrl, withQr: true }),
+            entity: { type: 'booking', id: reg.id },
+            attachments:
+              type === 'received'
+                ? async () => [
+                    { filename: 'ticket-qr.png', content: await QRCode.toBuffer(reg.ticketNumber, { width: 400, margin: 1 }), cid: 'qr-ticket' },
+                  ]
+                : undefined,
+          });
+    const label = type === 'reminder' ? 'Reminder' : type === 'status' ? 'Status email' : 'Booking email';
+    res.status(result.status === 'sent' ? 200 : 502).json({ status: result.status, message: deliveryMessage(result.status, label) });
   } catch (err) {
     next(err);
   }
@@ -283,6 +451,7 @@ const eventFormSchema = z.object({
   imageUrl: urlOrPathSchema.optional(),
   price: z.coerce.number().int().min(0),
   maxSpots: z.coerce.number().int().positive(),
+  kind: z.enum(EVENT_KINDS).optional(),
   category: optionalLabel(60),
   difficulty: optionalLabel(40),
   duration: optionalLabel(60),
@@ -331,6 +500,7 @@ eventsRouter.post('/', requireAdminKey, uploadEventImage.single('image'), async 
         time: input.time,
         location: input.location,
         trainers: JSON.stringify(parseTrainers(input.trainers)),
+        kind: input.kind ?? 'event',
         category: input.category,
         difficulty: input.difficulty,
         duration: input.duration,
@@ -369,6 +539,7 @@ eventsRouter.put('/:id', requireAdminKey, uploadEventImage.single('image'), asyn
       location: input.location,
       price: input.price,
       maxSpots: input.maxSpots,
+      kind: input.kind,
       category: input.category,
       difficulty: input.difficulty,
       duration: input.duration,
@@ -490,6 +661,7 @@ const registerSchema = z.object({
     .max(500)
     .optional()
     .transform((v) => v || undefined),
+  requestId: z.string().trim().min(8).max(64).regex(/^[A-Za-z0-9_-]+$/).optional(),
 });
 
 /**
@@ -506,6 +678,22 @@ eventsRouter.post('/:slug/register', publicWriteLimiter, optionalAuth, async (re
     const user = req.user
       ? await prisma.user.findFirst({ where: { id: req.user.id, appId: tenant.id } })
       : null;
+
+    // A retried submission (double tap, flaky network) returns the original
+    // booking — no second set of spots, no second round of emails.
+    if (input.requestId) {
+      const previous = await prisma.eventRegistration.findUnique({
+        where: { appId_requestId: { appId: tenant.id, requestId: input.requestId } },
+        include: { event: true },
+      });
+      if (previous) {
+        return res.status(200).json({
+          registration: serializeRegistration(previous),
+          whatsapp: bookingWhatsApp(tenant, previous),
+          duplicate: true,
+        });
+      }
+    }
 
     const { registration, event } = await prisma.$transaction(async (tx) => {
       const found = await tx.event.findUnique({
@@ -550,66 +738,16 @@ eventsRouter.post('/:slug/register', publicWriteLimiter, optionalAuth, async (re
           notes: input.notes,
           total: found.price * input.participants,
           status: 'pending',
+          requestId: input.requestId,
         },
       });
       return { registration: created, event: found };
     });
 
-    const brand = mailBrandFor(tenant);
-    const eventDate = event.date.toLocaleDateString('en-KE', {
-      weekday: 'long',
-      month: 'long',
-      day: 'numeric',
-      year: 'numeric',
-      timeZone: 'Africa/Nairobi',
-    });
-    if (registration.attendeeEmail) {
-      const to = registration.attendeeEmail;
-      // Ticket email (with a QR of the reference for door check-in) is a side
-      // effect of the saved booking — never delays or fails the response.
-      QRCode.toBuffer(registration.ticketNumber, { width: 400 })
-        .then((qr) =>
-          sendMailInBackground(
-            {
-              to,
-              brand,
-              ...eventTicketEmail({
-                ticketNumber: registration.ticketNumber,
-                attendeeName: registration.attendeeName,
-                eventTitle: event.title,
-                date: eventDate,
-                time: event.time,
-                location: event.location,
-                price: registration.total,
-              }),
-              attachments: [{ filename: 'ticket-qr.png', content: qr, cid: 'qr-ticket' }],
-            },
-            `ticket email ${registration.ticketNumber}`
-          )
-        )
-        .catch((err) => console.error(`[events] QR generation failed for ${registration.ticketNumber}:`, err));
-    }
-    sendMailInBackground(
-      {
-        to: notificationEmailFor(tenant),
-        brand,
-        ...eventRegistrationAlertEmail({
-          ticketNumber: registration.ticketNumber,
-          eventTitle: event.title,
-          attendeeName: registration.attendeeName,
-          attendeePhone: registration.attendeePhone,
-          attendeeEmail: registration.attendeeEmail,
-          participants: registration.participants,
-          price: registration.total,
-        }),
-      },
-      `booking alert ${registration.ticketNumber}`
-    );
+    const whatsapp = bookingWhatsApp(tenant, { ...registration, event });
+    sendBookingReceivedEmails(tenant, registration, event, whatsapp?.url);
 
-    res.status(201).json({
-      registration: serializeRegistration(registration),
-      whatsapp: bookingWhatsApp(tenant, { ...registration, event }),
-    });
+    res.status(201).json({ registration: serializeRegistration(registration), whatsapp });
   } catch (err) {
     next(err);
   }

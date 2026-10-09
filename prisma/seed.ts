@@ -1,12 +1,37 @@
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
+import crypto from 'crypto';
 import { slugify } from '../src/utils/slugify';
+import { seedContent } from './seedContent';
 
 const prisma = new PrismaClient();
 
-const ADMIN_EMAIL = 'admin@marksila254.com';
-const ADMIN_PASSWORD = 'Marksila254!Admin';
+// The first admin login of each app. Never hardcode the password: pass
+// SEED_ADMIN_PASSWORD, or a random one is generated and printed once.
+// Change or reset it later with `npm run app -- set-password ...`.
+const ADMIN_EMAIL = (process.env.SEED_ADMIN_EMAIL || 'admin@marksila254.com').toLowerCase();
+const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD || `${crypto.randomBytes(9).toString('base64url')}Aa1!`;
+
+async function ensureAdmin(appId: number, label: string) {
+  const existing = await prisma.user.findUnique({ where: { appId_email: { appId, email: ADMIN_EMAIL } } });
+  if (existing) return;
+  await prisma.user.create({
+    data: {
+      appId,
+      name: 'Admin',
+      username: 'admin',
+      email: ADMIN_EMAIL,
+      password: await bcrypt.hash(ADMIN_PASSWORD, 10),
+      role: 'admin',
+      emailVerified: true,
+    },
+  });
+  console.log(
+    `[${label}] Created admin login ${ADMIN_EMAIL}` +
+      (process.env.SEED_ADMIN_PASSWORD ? ' (password from SEED_ADMIN_PASSWORD).' : ` with password: ${ADMIN_PASSWORD}  (shown once — change it).`)
+  );
+}
 
 interface TrainingSeed {
   title: string;
@@ -478,20 +503,7 @@ async function seedFitness() {
   }
   console.log(`[fitness] Created ${created} products (${products.length - created} already existed).`);
 
-  const existingAdmin = await prisma.user.findUnique({ where: { appId_email: { appId: fitnessId, email: ADMIN_EMAIL } } });
-  if (!existingAdmin) {
-    await prisma.user.create({
-      data: {
-        appId: fitnessId,
-        name: 'Admin',
-        username: 'admin',
-        email: ADMIN_EMAIL,
-        password: await bcrypt.hash(ADMIN_PASSWORD, 10),
-        role: 'admin',
-      },
-    });
-    console.log(`[fitness] Created admin user: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} — change this password.`);
-  }
+  await ensureAdmin(fitnessId, 'fitness');
 
   let trainingsCreated = 0;
   for (const [index, t] of trainings.entries()) {
@@ -558,6 +570,7 @@ async function seedSos() {
         time: a.time,
         location: a.location,
         trainers: '[]',
+        kind: 'adventure',
         category: a.category,
         difficulty: a.difficulty,
         duration: a.duration,
@@ -569,12 +582,14 @@ async function seedSos() {
     created += 1;
   }
   console.log(`[sos] Created ${created} adventures (${sosAdventures.length - created} already existed).`);
+  await ensureAdmin(sosId, 'sos');
 }
 
 async function main() {
   const only = process.argv[2]; // optional: "fitness" | "sos"
   if (!only || only === 'fitness') await seedFitness();
   if (!only || only === 'sos') await seedSos();
+  await seedContent(prisma, only);
 }
 
 main()

@@ -103,3 +103,56 @@ export function bookingWhatsApp(tenant: Tenant, booking: BookingForMessage): Wha
     'Please confirm my spot. Thank you!',
   ]);
 }
+
+/** Plain "chat with us" link with an optional opening line. */
+export function chatWhatsApp(tenant: Tenant, message: string): WhatsAppHandoff | null {
+  return handoff(tenant, [message]);
+}
+
+export interface EnquiryForMessage {
+  reference: string;
+  type: 'contact' | 'booking' | 'corporate' | 'quote';
+  name: string;
+  phone: string;
+  email?: string | null;
+  company?: string | null;
+  participants?: number | null;
+  preferredDate?: Date | null;
+  location?: string | null;
+  serviceName?: string | null;
+  packageName?: string | null;
+  estimate?: number | null;
+  message?: string | null;
+}
+
+const ENQUIRY_OPENERS: Record<EnquiryForMessage['type'], string> = {
+  contact: 'I have a question.',
+  booking: "I'd like to book.",
+  corporate: "I'd like to arrange a corporate booking.",
+  quote: "I'd like a quotation.",
+};
+
+export function enquiryWhatsApp(tenant: Tenant, e: EnquiryForMessage): WhatsAppHandoff | null {
+  const date = e.preferredDate
+    ? e.preferredDate.toLocaleDateString('en-KE', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Africa/Nairobi' })
+    : null;
+  return handoff(tenant, [
+    `Hello ${tenant.name}, ${ENQUIRY_OPENERS[e.type]}`,
+    '',
+    `*Ref ${e.reference}*`,
+    e.serviceName ? `Service: ${e.serviceName}` : null,
+    e.packageName ? `Package: ${e.packageName}` : null,
+    e.company ? `Company: ${e.company}` : null,
+    e.participants ? `Participants: ${e.participants}` : null,
+    date ? `Preferred date: ${date}` : null,
+    e.location ? `Location: ${e.location}` : null,
+    e.estimate ? `Estimate: ${kes(e.estimate)} (to be confirmed)` : null,
+    '',
+    `Name: ${e.name}`,
+    `Phone: ${e.phone}`,
+    e.email ? `Email: ${e.email}` : null,
+    e.message ? `Details: ${e.message}` : null,
+    '',
+    e.type === 'contact' ? 'Thank you!' : 'Please confirm availability and pricing. Thank you!',
+  ]);
+}

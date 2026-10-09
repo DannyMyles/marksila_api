@@ -49,10 +49,19 @@ model App {
   youtubeChannelHandle String?  @db.VarChar(100) // gallery videos; null = none
   orderPrefix          String   @default("ORD") @db.VarChar(10)
   bookingPrefix        String   @default("BKG") @db.VarChar(10)
+  enquiryPrefix        String   @default("ENQ") @db.VarChar(10)
+  tagline              String?  @db.VarChar(255)
+  // JSON site content edited from the admin Settings screen (hero, social
+  // links, hours, stats, brand colours ...). Shape: src/services/siteSettings.ts
+  settings             String?  @db.LongText
   active               Boolean  @default(true)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
+  enquiries          Enquiry[]
+  faqs               Faq[]
+  banners            Banner[]
+  emailLogs          EmailLog[]
   users              User[]
   blogs              Blog[]
   testimonials       Testimonial[]
@@ -84,6 +93,7 @@ model User {
   verifyTokenExpiry  DateTime?
   eventRegistrations EventRegistration[]
   orders             Order[]
+  enquiries          Enquiry[]
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
@@ -145,29 +155,217 @@ model Testimonial {
   @@index([appId])
 }
 
+enum ServiceAudience {
+  individual
+  corporate
+  both
+}
+
+// How a service/package price is presented and whether WhatsApp messages
+// can quote a total: fixed = one price, per_person = x participants,
+// quote = price agreed after an enquiry (large or custom groups).
+enum PricingType {
+  fixed
+  per_person
+  quote
+}
+
+// A bookable offering of an app: Fitness programmes, corporate wellness and
+// team-building activities, SOS outdoor activities and aerobics classes.
+// `category` is free text so a new kind of offering needs no code change.
 model Training {
-  id               Int      @id @default(autoincrement())
-  app              App      @relation(fields: [appId], references: [id], onDelete: Restrict)
-  appId            Int
-  title            String
-  slug             String?
-  description      String   @db.Text
-  features         String   @db.Text // JSON-encoded string[]
-  price            String
-  imageUrl         String?  @db.VarChar(512)
-  imageFilename    String?
-  imageContentType String?
-  imageSize        Int?
-  icon             String?
-  color            String?
-  popular          Boolean  @default(false)
-  order            Int      @default(0)
-  published        Boolean  @default(true)
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  id                  Int              @id @default(autoincrement())
+  app                 App              @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId               Int
+  title               String
+  slug                String?
+  description         String           @db.Text
+  features            String           @db.Text // JSON-encoded string[]
+  price               String // display label, e.g. "From KES 2,000/session"
+  priceAmount         Int? // KES, used for estimates; null = on request
+  pricingType         PricingType      @default(fixed)
+  category            String?          @db.VarChar(60)
+  audience            ServiceAudience  @default(individual)
+  duration            String?          @db.VarChar(60)
+  groupSize           String?          @db.VarChar(60)
+  schedule            String?          @db.VarChar(120)
+  level               String?          @db.VarChar(40)
+  location            String?          @db.VarChar(160)
+  minParticipants     Int?
+  maxParticipants     Int?
+  bookingRequirements String?          @db.Text
+  imageUrl            String?          @db.VarChar(512)
+  imageFilename       String?
+  imageContentType    String?
+  imageSize           Int?
+  icon                String?
+  color               String?
+  popular             Boolean          @default(false)
+  available           Boolean          @default(true) // false = shown but not bookable
+  order               Int              @default(0)
+  published           Boolean          @default(true)
+  packages            ServicePackage[]
+  enquiries           Enquiry[]
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
 
   @@unique([appId, slug])
   @@index([appId])
+  @@index([appId, category])
+  @@index([appId, audience])
+}
+
+// Priced tiers of a service (e.g. corporate gym membership Bronze/Silver/Gold).
+// Tenant ownership comes from the parent service.
+model ServicePackage {
+  id              Int         @id @default(autoincrement())
+  training        Training    @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  trainingId      Int
+  name            String      @db.VarChar(120)
+  description     String?     @db.Text
+  priceAmount     Int?
+  pricingType     PricingType @default(fixed)
+  priceLabel      String?     @db.VarChar(100)
+  minParticipants Int?
+  maxParticipants Int?
+  features        String?     @db.Text // JSON-encoded string[]
+  popular         Boolean     @default(false)
+  order           Int         @default(0)
+  active          Boolean     @default(true)
+  enquiries       Enquiry[]
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([trainingId])
+}
+
+enum EnquiryType {
+  contact
+  booking
+  corporate
+  quote
+}
+
+enum EnquiryStatus {
+  new
+  contacted
+  quoted
+  confirmed
+  completed
+  cancelled
+}
+
+// Every customer request that isn't a dated event booking: contact-form
+// messages, service bookings, corporate bookings and quotation requests.
+// Service/package names are snapshotted so history survives edits/deletes.
+model Enquiry {
+  id            Int             @id @default(autoincrement())
+  app           App             @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId         Int
+  reference     String          @unique @db.VarChar(30)
+  type          EnquiryType
+  status        EnquiryStatus   @default(new)
+  name          String          @db.VarChar(100)
+  phone         String          @db.VarChar(20)
+  email         String?         @db.VarChar(255)
+  company       String?         @db.VarChar(160)
+  participants  Int?
+  preferredDate DateTime?
+  location      String?         @db.VarChar(200)
+  training      Training?       @relation(fields: [trainingId], references: [id], onDelete: SetNull)
+  trainingId    Int?
+  package       ServicePackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  packageId     Int?
+  serviceName   String?         @db.VarChar(200)
+  packageName   String?         @db.VarChar(120)
+  estimate      Int? // KES computed from the price at submission; null = on request
+  quotedAmount  Int? // KES set by an admin when quoting
+  message       String?         @db.Text
+  adminNotes    String?         @db.Text
+  user          User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId        Int?
+  // Client-generated id: a retried submission returns the original record
+  // (and sends no second email) instead of creating a duplicate.
+  requestId     String?         @db.VarChar(64)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@unique([appId, requestId])
+  @@index([appId, status])
+  @@index([appId, type])
+  @@index([appId, createdAt])
+  @@index([trainingId])
+  @@index([packageId])
+}
+
+model Faq {
+  id        Int      @id @default(autoincrement())
+  app       App      @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId     Int
+  question  String   @db.VarChar(300)
+  answer    String   @db.Text
+  category  String?  @db.VarChar(60)
+  order     Int      @default(0)
+  published Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([appId, order])
+}
+
+// Homepage banners and promotional offers, optionally limited to a date window.
+model Banner {
+  id            Int       @id @default(autoincrement())
+  app           App       @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId         Int
+  placement     String    @default("home") @db.VarChar(40) // home | promo | corporate | ...
+  title         String    @db.VarChar(160)
+  subtitle      String?   @db.Text
+  badge         String?   @db.VarChar(60)
+  imageUrl      String?   @db.VarChar(512)
+  imageFilename String?
+  ctaLabel      String?   @db.VarChar(60)
+  ctaUrl        String?   @db.VarChar(512)
+  startsAt      DateTime?
+  endsAt        DateTime?
+  order         Int       @default(0)
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([appId, placement])
+}
+
+enum EmailStatus {
+  queued
+  sent
+  failed
+  skipped
+}
+
+// One row per outgoing email: delivery status for admins, and `dedupeKey`
+// (unique per app) so a retried action never emails the same thing twice.
+model EmailLog {
+  id         Int         @id @default(autoincrement())
+  app        App         @relation(fields: [appId], references: [id], onDelete: Restrict)
+  appId      Int
+  kind       String      @db.VarChar(60)
+  to         String      @db.VarChar(255)
+  subject    String      @db.VarChar(255)
+  status     EmailStatus @default(queued)
+  error      String?     @db.Text
+  messageId  String?     @db.VarChar(255)
+  dedupeKey  String?     @db.VarChar(150)
+  entityType String?     @db.VarChar(40)
+  entityId   Int?
+  attempts   Int         @default(0)
+  createdAt  DateTime    @default(now())
+  sentAt     DateTime?
+
+  @@unique([appId, dedupeKey])
+  @@index([appId, createdAt])
+  @@index([appId, status])
+  @@index([appId, entityType, entityId])
 }
 
 model Category {
@@ -274,6 +472,7 @@ model OrderItem {
 enum TicketStatus {
   pending
   confirmed
+  completed
   cancelled
 }
 
@@ -294,6 +493,9 @@ model Event {
   imageSize        Int?
   price            Int // KES per person, 0 = free / price on request
   maxSpots         Int
+  // "event" (classes, workshops, fun runs) or "adventure" (SOS trips) — lets
+  // one app list them on separate pages while sharing booking & capacity.
+  kind             String              @default("event") @db.VarChar(20)
   // Optional descriptors used by listing pages (e.g. SOS adventures).
   category         String?             @db.VarChar(60)
   difficulty       String?             @db.VarChar(40)
@@ -306,6 +508,7 @@ model Event {
 
   @@unique([appId, slug])
   @@index([appId])
+  @@index([appId, kind, date])
 }
 
 model GalleryCategory {
@@ -359,9 +562,13 @@ model EventRegistration {
   // timestamp (no separate boolean) so "checked in" and "when" are the same
   // fact, can't drift apart.
   checkedInAt   DateTime?
+  requestId     String?      @db.VarChar(64) // client retry id, see Enquiry.requestId
   createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @default(now()) @updatedAt
 
   @@unique([eventId, userId])
+  @@unique([appId, requestId])
   @@index([eventId])
   @@index([appId])
+  @@index([appId, status])
 }

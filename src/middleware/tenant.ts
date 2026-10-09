@@ -2,6 +2,8 @@ import { NextFunction, Request, Response } from 'express';
 import { App } from '@prisma/client';
 import { prisma } from '../prisma';
 import { env } from '../env';
+import { DEFAULT_BRAND_COLORS, parseSiteSettings } from '../services/siteSettings';
+import type { MailBrand } from '../mailer';
 
 /**
  * Tenant (application) resolution.
@@ -31,6 +33,9 @@ export type Tenant = Pick<
   | 'youtubeChannelHandle'
   | 'orderPrefix'
   | 'bookingPrefix'
+  | 'enquiryPrefix'
+  | 'tagline'
+  | 'settings'
 >;
 
 declare global {
@@ -90,18 +95,34 @@ export function frontendUrlFor(tenant: Tenant): string {
   return (tenant.frontendUrl || env.frontendUrl).replace(/\/+$/, '');
 }
 
+/** Link to a page of this app's admin area (used in team alert emails). */
+export function adminUrlFor(tenant: Tenant, path: string): string {
+  return `${frontendUrlFor(tenant)}/admin${path.startsWith('/') ? path : `/${path}`}`;
+}
+
 /** Where this app's new-order/booking/contact alerts are emailed. */
 export function notificationEmailFor(tenant: Tenant): string {
-  return tenant.notificationEmail || env.adminNotificationEmail;
+  return tenant.notificationEmail || env.adminNotificationEmail || tenant.contactEmail || '';
 }
 
 /** Branding used for this app's outgoing emails (see mailer.ts). */
-export function mailBrandFor(tenant: Tenant) {
+export function mailBrandFor(tenant: Tenant): MailBrand {
+  const settings = parseSiteSettings(tenant.settings);
+  const defaults = DEFAULT_BRAND_COLORS[tenant.key] ?? { primary: '#EA580C', secondary: '#0F766E' };
   return {
     key: tenant.key,
     name: tenant.name,
+    tagline: tenant.tagline,
     contactPhone: tenant.contactPhone,
     contactEmail: tenant.contactEmail,
     location: tenant.location,
+    whatsappNumber: tenant.whatsappNumber,
+    websiteUrl: frontendUrlFor(tenant),
+    primaryColor: settings.brand?.primaryColor || defaults.primary,
+    secondaryColor: settings.brand?.secondaryColor || defaults.secondary,
+    hours: settings.hours,
+    social: settings.social,
+    footerNote: settings.email?.footerNote,
+    signature: settings.email?.signature,
   };
 }

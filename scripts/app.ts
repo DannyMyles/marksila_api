@@ -11,6 +11,10 @@
  *   npm run app -- set-key --key fitness --admin-key "<existing key>"
  *   npm run app -- create-admin --key sos --email you@example.com --name "Your Name"
  *       # creates (or resets) an admin login for that app; prints a password once
+ *   ADMIN_PASSWORD='...' npm run app -- set-password --key sos --email you@example.com
+ *       # creates/resets that admin with a password you choose (read from the
+ *       # environment so it never lands in shell history as an argument).
+ *       # Use --key all to apply it to every app.
  *
  * Connecting a new frontend = `upsert` a new key, then have that frontend
  * send `X-App-Key: <key>` on every API call (its Next.js proxy does this).
@@ -22,6 +26,7 @@ import bcrypt from 'bcryptjs';
 import { PrismaClient } from '@prisma/client';
 import { hashAdminKey } from '../src/middleware/adminAuth';
 import { normalizeWhatsAppNumber } from '../src/services/whatsapp';
+import { passwordSchema } from '../src/utils/validation';
 
 const prisma = new PrismaClient();
 
@@ -146,8 +151,40 @@ async function main() {
       return;
     }
 
+    case 'set-password': {
+      const password = process.env.ADMIN_PASSWORD ?? '';
+      const check = passwordSchema.safeParse(password);
+      if (!check.success) throw new Error(`ADMIN_PASSWORD: ${check.error.issues[0].message}`);
+      const email = requireFlag(flags, 'email').trim().toLowerCase();
+      const key = requireFlag(flags, 'key');
+      const apps = key === 'all' ? await prisma.app.findMany({ where: { active: true } }) : await prisma.app.findMany({ where: { key } });
+      if (!apps.length) throw new Error('Unknown app key');
+      const hash = await bcrypt.hash(password, 10);
+      for (const app of apps) {
+        const existing = await prisma.user.findUnique({ where: { appId_email: { appId: app.id, email } } });
+        if (existing) {
+          await prisma.user.update({
+            where: { id: existing.id },
+            data: { password: hash, role: 'admin', isActive: true, emailVerified: true, resetToken: null, resetTokenExpiry: null },
+          });
+          console.log(`Updated password for ${email} (admin of "${app.key}").`);
+        } else {
+          const base = email.split('@')[0].replace(/[^a-z0-9]/g, '') || 'admin';
+          let username = base;
+          for (let n = 2; await prisma.user.findUnique({ where: { appId_username: { appId: app.id, username } } }); n++) {
+            username = `${base}${n}`;
+          }
+          await prisma.user.create({
+            data: { appId: app.id, name: flags.name ?? 'Admin', username, email, password: hash, role: 'admin', emailVerified: true },
+          });
+          console.log(`Created ${email} as an admin of "${app.key}".`);
+        }
+      }
+      return;
+    }
+
     default:
-      throw new Error('Usage: npm run app -- list | upsert --key <key> [...] | rotate-key --key <key> | set-key --key <key> --admin-key <key> | create-admin --key <key> --email <email> [--name <name>]');
+      throw new Error('Usage: npm run app -- list | upsert --key <key> [...] | rotate-key --key <key> | set-key --key <key> --admin-key <key> | create-admin --key <key> --email <email> [--name <name>] | set-password --key <key|all> --email <email> (password in ADMIN_PASSWORD)');
   }
 }
 

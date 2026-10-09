@@ -100,8 +100,7 @@ async function sendCampaignInBackground(
     const results = await Promise.allSettled(
       batch.map((sub) => {
         const unsubscribeUrl = `${frontendUrl}/newsletter/unsubscribe?email=${encodeURIComponent(sub.email)}&token=${unsubscribeToken(appKey, sub.email)}`;
-        const { html } = newsletterCampaignEmail({ subject, message, unsubscribeUrl });
-        return sendMail({ to: sub.email, subject, html, brand });
+        return sendMail({ to: sub.email, brand, template: newsletterCampaignEmail({ subject, message, unsubscribeUrl }) });
       })
     );
     sent += results.filter((r) => r.status === 'fulfilled').length;

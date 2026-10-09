@@ -5,8 +5,8 @@ import { z } from 'zod';
 import { prisma } from '../prisma';
 import { ApiError } from '../middleware/errorHandler';
 import { requireAuth, signUserToken, verifyUserToken } from '../middleware/userAuth';
-import { sendMailInBackground, passwordResetEmail, verificationEmail } from '../mailer';
-import { frontendUrlFor, mailBrandFor, tenantOf } from '../middleware/tenant';
+import { deliverEmailInBackground, passwordResetEmail, verificationEmail } from '../mailer';
+import { frontendUrlFor, tenantOf } from '../middleware/tenant';
 import { passwordSchema } from '../utils/validation';
 import { authLimiter } from '../middleware/rateLimiters';
 
@@ -60,10 +60,7 @@ authRouter.post('/register', authLimiter, async (req, res, next) => {
     });
 
     const verifyUrl = `${frontendUrlFor(tenant)}/verify-email?token=${verifyToken}`;
-    sendMailInBackground(
-      { to: user.email, brand: mailBrandFor(tenant), ...verificationEmail(verifyUrl) },
-      `verification email to ${user.email}`
-    );
+    deliverEmailInBackground({ tenant, kind: 'verify_email', to: user.email, template: verificationEmail(verifyUrl), entity: { type: 'user', id: user.id } });
 
     res.status(201).json({
       message: 'Account created. Check your email to verify your account before logging in.',
@@ -166,10 +163,7 @@ authRouter.post('/forgot-password', authLimiter, async (req, res, next) => {
       await prisma.user.update({ where: { id: user.id }, data: { resetToken, resetTokenExpiry } });
 
       const resetUrl = `${frontendUrlFor(tenant)}/reset-password?token=${resetToken}`;
-      sendMailInBackground(
-        { to: user.email, brand: mailBrandFor(tenant), ...passwordResetEmail(resetUrl) },
-        `password reset email to ${user.email}`
-      );
+      deliverEmailInBackground({ tenant, kind: 'password_reset', to: user.email, template: passwordResetEmail(resetUrl), entity: { type: 'user', id: user.id } });
     }
 
     res.json({ message: GENERIC_FORGOT_PASSWORD_MESSAGE });
@@ -294,10 +288,7 @@ authRouter.post('/resend-verification', authLimiter, async (req, res, next) => {
       await prisma.user.update({ where: { id: user.id }, data: { verifyToken, verifyTokenExpiry } });
 
       const verifyUrl = `${frontendUrlFor(tenant)}/verify-email?token=${verifyToken}`;
-      sendMailInBackground(
-        { to: user.email, brand: mailBrandFor(tenant), ...verificationEmail(verifyUrl) },
-        `verification email to ${user.email}`
-      );
+      deliverEmailInBackground({ tenant, kind: 'verify_email', to: user.email, template: verificationEmail(verifyUrl), entity: { type: 'user', id: user.id } });
     }
 
     res.json({ message: GENERIC_RESEND_VERIFICATION_MESSAGE });
