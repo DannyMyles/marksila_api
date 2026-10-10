@@ -117,7 +117,7 @@ adminRouter.get('/stats', async (req, res, next) => {
       },
       services: { total: sum(servicesByAudience), byAudience: servicesByAudience, upcomingEvents },
       orders: { total: sum(ordersByStatus), byStatus: ordersByStatus, paidRevenue: orderRevenue._sum.total ?? 0 },
-      emails: { configured: isEmailConfigured(), last30Days: countBy(emailStatus, 'status'), failed: failedEmails },
+      emails: { configured: isEmailConfigured(tenantOf(req).key), last30Days: countBy(emailStatus, 'status'), failed: failedEmails },
       audience: { users, subscribers, testimonials },
       recentBookings: recentBookings.map((b) => ({
         id: b.id,
@@ -175,7 +175,7 @@ adminRouter.get('/emails', async (req, res, next) => {
         select: { id: true, kind: true, to: true, subject: true, status: true, error: true, entityType: true, entityId: true, attempts: true, createdAt: true, sentAt: true },
       }),
     ]);
-    res.json({ emails, total, page: query.page, pageSize: query.pageSize, configured: isEmailConfigured() });
+    res.json({ emails, total, page: query.page, pageSize: query.pageSize, configured: isEmailConfigured(tenantOf(req).key) });
   } catch (err) {
     next(err);
   }

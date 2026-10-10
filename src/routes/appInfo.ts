@@ -54,7 +54,7 @@ appInfoRouter.get('/admin', requireAdminKey, async (req, res, next) => {
       orderPrefix: app.orderPrefix,
       bookingPrefix: app.bookingPrefix,
       enquiryPrefix: app.enquiryPrefix,
-      emailConfigured: isEmailConfigured(),
+      emailConfigured: isEmailConfigured(app.key),
     });
   } catch (err) {
     next(err);

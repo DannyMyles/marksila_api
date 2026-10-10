@@ -7,16 +7,71 @@ import { prisma } from './prisma';
 import type { Tenant } from './middleware/tenant';
 import { mailBrandFor } from './middleware/tenant';
 
-const transporter = env.smtpHost
-  ? nodemailer.createTransport({
-      host: env.smtpHost,
-      port: env.smtpPort,
-      secure: env.smtpPort === 465,
-      auth: env.smtpUser ? { user: env.smtpUser, pass: env.smtpPass } : undefined,
-    })
-  : null;
+/**
+ * SMTP settings per app: SMTP_<APP>_HOST / _PORT / _USER / _PASS / MAIL_FROM_<APP>
+ * (e.g. SMTP_FITNESS_USER) override the shared SMTP_* values, so each app
+ * can send from its own mailbox. An app with neither has email switched off.
+ */
+interface SmtpConfig {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  from: string;
+}
 
-export const isEmailConfigured = () => Boolean(transporter);
+function smtpConfigFor(appKey: string): SmtpConfig | null {
+  const k = appKey.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  const pick = (name: string) => process.env[`SMTP_${k}_${name}`];
+  const host = pick('HOST') ?? env.smtpHost;
+  if (!host) return null;
+  const user = pick('USER') ?? env.smtpUser;
+  return {
+    host,
+    port: Number(pick('PORT') ?? env.smtpPort),
+    user,
+    // App passwords are often copied with spaces ("abcd efgh ..."); Gmail wants them without.
+    pass: (pick('PASS') ?? env.smtpPass).replace(/\s+/g, ''),
+    from: process.env[`MAIL_FROM_${k}`] || (pick('HOST') ? '' : env.mailFrom) || user,
+  };
+}
+
+const transporters = new Map<string, { config: SmtpConfig; transport: nodemailer.Transporter } | null>();
+
+function transporterFor(appKey: string) {
+  if (!transporters.has(appKey)) {
+    const config = smtpConfigFor(appKey);
+    transporters.set(
+      appKey,
+      config
+        ? {
+            config,
+            transport: nodemailer.createTransport({
+              host: config.host,
+              port: config.port,
+              secure: config.port === 465,
+              auth: config.user ? { user: config.user, pass: config.pass } : undefined,
+            }),
+          }
+        : null
+    );
+  }
+  return transporters.get(appKey) ?? null;
+}
+
+export const isEmailConfigured = (appKey: string) => Boolean(transporterFor(appKey));
+
+/** Checks the login with the mail server without sending anything. */
+export async function verifyEmailSettings(appKey: string): Promise<{ ok: boolean; error?: string }> {
+  const t = transporterFor(appKey);
+  if (!t) return { ok: false, error: 'Email is not configured for this app.' };
+  try {
+    await t.transport.verify();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 /**
  * Who an email is sent on behalf of. The backend serves several apps, so
@@ -467,13 +522,13 @@ export async function sendMail(options: SendMailOptions): Promise<{ messageId: s
     ...(logo ? [{ filename: 'logo.png', content: logo, cid: 'brand-logo' }] : []),
     ...(options.attachments ?? []),
   ];
-  if (!transporter) {
+  const t = transporterFor(options.brand.key);
+  if (!t) {
     writePreview(options.brand.key, options.to, rendered, options.attachments);
     throw new Error('Email is not configured on the server (set SMTP_HOST).');
   }
-  const from = env.mailFrom || env.smtpUser;
-  const info = await transporter.sendMail({
-    from: `"${options.brand.name.replace(/"/g, '')}" <${from}>`,
+  const info = await t.transport.sendMail({
+    from: `"${options.brand.name.replace(/"/g, '')}" <${t.config.from}>`,
     to: options.to,
     replyTo: options.replyTo,
     subject: rendered.subject,
@@ -555,7 +610,7 @@ export async function deliverEmail(opts: DeliverOptions): Promise<{ status: Deli
   const brand = mailBrandFor(opts.tenant);
   try {
     const attachments = typeof opts.attachments === 'function' ? await opts.attachments() : opts.attachments;
-    if (!transporter) {
+    if (!transporterFor(brand.key)) {
       writePreview(brand.key, to, renderEmail(opts.template, brand), attachments);
       const error = 'Email is not configured on the server (SMTP_HOST not set).';
       await prisma.emailLog.update({ where: { id: logId }, data: { status: 'skipped', error, attempts: { increment: 1 } } });
