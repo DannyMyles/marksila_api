@@ -10,6 +10,8 @@ function required(name: string): string {
 
 export const env = {
   port: Number(process.env.PORT ?? 4000),
+  // Set HOST=127.0.0.1 in production so only the local reverse proxy can reach the API.
+  host: process.env.HOST || undefined,
   databaseUrl: required('DATABASE_URL'),
   // Comma-separated browser origins allowed to call the API directly. The
   // frontends normally go through their own same-origin /api proxy, so this
