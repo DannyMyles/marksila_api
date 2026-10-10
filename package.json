@@ -13,7 +13,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "seed": "tsx prisma/seed.ts",
     "app": "tsx scripts/app.ts",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "rebrand-images": "tsx scripts/rebrand-images.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.2.1",

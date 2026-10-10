@@ -4,6 +4,7 @@ import { PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
 import { slugify } from '../src/utils/slugify';
 import { seedContent } from './seedContent';
+import { IMAGE_COLORS, catalogImageUrl } from './catalogImages';
 
 const prisma = new PrismaClient();
 
@@ -143,8 +144,6 @@ const IMAGES_DIR = process.env.MARK254_IMAGES_DIR;
 if (!IMAGES_DIR) {
   throw new Error('MARK254_IMAGES_DIR is not set in .env');
 }
-// Public URL prefix the Next.js app serves these same files under (public/images/mark254/...)
-const PUBLIC_PREFIX = '/images/mark254';
 
 const APPAREL_SIZES = ['S', 'M', 'L', 'XL', 'XXL'];
 
@@ -492,10 +491,15 @@ async function seedFitness() {
         sizes: p.sizes ? JSON.stringify(p.sizes) : null,
         colors: p.colors ? JSON.stringify(p.colors) : null,
         images: {
-          create: p.images.map((filename, position) => ({
-            url: `${PUBLIC_PREFIX}/${p.categoryFolder}/${filename}`,
-            position,
-          })),
+          create: p.images.map((filename, position) => {
+            const key = `${p.categoryFolder}/${filename.replace(/\.png$/, '')}`;
+            const color = IMAGE_COLORS[key];
+            return {
+              url: catalogImageUrl(key),
+              position,
+              color: color && p.colors?.includes(color) ? color : null,
+            };
+          }),
         },
       },
     });
